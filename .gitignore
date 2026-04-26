@@ -1,0 +1,35 @@
+# Environment and local secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Go
+bin/
+*.test
+coverage.out
+
+# Orison local runtime state
+.orison/
+*.sqlite3
+*.sqlite3-*
+
+# QQ/NapCat local runtime databases
+*.db
+*.db-shm
+*.db-wal
+
+# oh-my-codex local runtime state
+.omx/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+

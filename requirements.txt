@@ -1,0 +1,3 @@
+httpx
+oauth-cli-kit
+pypdf
