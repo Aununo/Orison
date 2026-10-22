@@ -226,12 +226,14 @@ class OpenAICodexProvider:
             "parallel_tool_calls": True,
         }
         converted_tools = _convert_tools(request.tools) if request.tools else []
-        if not any(tool.get("type") == "image_generation" for tool in converted_tools):
+        if not request.metadata.get("orison_internal") and not any(tool.get("type") == "image_generation" for tool in converted_tools):
             converted_tools.append({"type": "image_generation"})
         if converted_tools:
             body["tools"] = converted_tools
         if self.config.reasoning_effort:
             body["reasoning"] = {"effort": self.config.reasoning_effort}
+        if self.config.service_tier:
+            body["service_tier"] = self.config.service_tier
         return body
 
 
@@ -260,6 +262,7 @@ async def _consume_sse(
     error: str | None = None
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, str]] = {}
+    completed = False
 
     async for raw in _iter_sse(response):
         raw_events.append(raw)
@@ -299,11 +302,16 @@ async def _consume_sse(
                     )
                 )
         elif event_type == "response.completed":
+            completed = True
             response_obj = raw.get("response") if isinstance(raw.get("response"), dict) else {}
             usage = response_obj.get("usage") if isinstance(response_obj.get("usage"), dict) else usage
         elif event_type in {"error", "response.failed"}:
             error = _event_error(raw)
+        elif event_type == "response.incomplete":
+            error = "Codex response was incomplete"
 
+    if not completed and not error:
+        error = "Codex response stream ended before completion"
     return "".join(content_parts), raw_events, usage, response_id, error, tool_calls
 
 
@@ -355,7 +363,11 @@ def _convert_messages(messages: list[ProviderMessage]) -> list[dict[str, Any]]:
         content_type = "input_text" if role == "user" else "output_text"
         content_blocks: list[dict[str, Any]] = []
         if message.content:
-            content_blocks.append({"type": content_type, "text": message.content})
+            text = message.content
+            if role == "user" and message.metadata.get("speaker_id"):
+                speaker = {key: message.metadata[key] for key in ("speaker_id", "role", "name", "native_name", "timestamp") if key in message.metadata}
+                text = "[Message author: " + json.dumps(speaker, ensure_ascii=True) + "]\n" + text
+            content_blocks.append({"type": content_type, "text": text})
         if role == "user":
             content_blocks.extend(_image_content_blocks(message.metadata))
         if content_blocks:
@@ -397,9 +409,11 @@ def _image_content_blocks(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     for image in images:
         if not isinstance(image, dict):
             continue
-        url = image.get("url") or image.get("file") or image.get("data")
-        if not isinstance(url, str) or not url.strip():
+        url = image.get("data") or image.get("url") or image.get("file")
+        if not isinstance(url, str) or not url.startswith(("https://", "http://", "data:image/")):
             continue
+        if isinstance(image.get("index"), int):
+            blocks.append({"type": "input_text", "text": f"[Image {image['index']}]"})
         blocks.append({"type": "input_image", "image_url": url.strip()})
     return blocks
 

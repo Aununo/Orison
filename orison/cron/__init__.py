@@ -9,6 +9,10 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Callable
 
 from orison.core.storage import CoreStorage
+from orison.timezone import BOT_TIMEZONE
+
+
+DEFAULT_DREAM_SCHEDULE = "daily:03:00"
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,17 @@ class CronManager:
     def __init__(self, storage: CoreStorage, run_job: RunJobCallback) -> None:
         self.storage = storage
         self._run_job = run_job
+        # Repair daily timestamps persisted when schedules used the host timezone.
+        for job in self.list_jobs():
+            if not job.enabled or not job.schedule.startswith("daily:"):
+                continue
+            scheduled_time = (
+                _parse_iso(job.next_run_at).astimezone(BOT_TIMEZONE).time() if job.next_run_at else None
+            )
+            if scheduled_time != _parse_daily_time(job.schedule.removeprefix("daily:")):
+                now = _utc_now()
+                updated = _replace_job(job, next_run_at=_next_run_at(job.schedule, now), updated_at=_iso(now))
+                self.storage.upsert_cron_job(asdict(updated))
 
     def list_jobs(self) -> list[CronJob]:
         return [_job_from_dict(raw) for raw in self.storage.list_cron_jobs()]
@@ -118,6 +133,17 @@ class CronManager:
     def delete_job(self, job_id: str) -> bool:
         return self.storage.delete_cron_job(job_id)
 
+    def reschedule_job(self, job_id: str, schedule: str) -> CronJob:
+        job = self._require_job(job_id)
+        schedule = _non_empty(schedule, "schedule")
+        now = _utc_now()
+        next_run = _next_run_at(schedule, now)
+        updated = _replace_job(
+            job, schedule=schedule, next_run_at=next_run if job.enabled else None, updated_at=_iso(now),
+        )
+        self.storage.upsert_cron_job(asdict(updated))
+        return updated
+
     def trigger_now(self, job_id: str) -> CronRunResult:
         return self._run_and_update(self._require_job(job_id), manual=True)
 
@@ -180,6 +206,7 @@ def cron_run_payload(result: CronRunResult) -> dict[str, object]:
 
 
 def _next_run_at(schedule: str, now: datetime, *, after_run: bool = False) -> str | None:
+    """Return a UTC timestamp, interpreting naive and daily schedules in Singapore time."""
     if schedule.startswith("once:"):
         run_at = _parse_iso(schedule.removeprefix("once:"))
         if after_run:
@@ -192,9 +219,8 @@ def _next_run_at(schedule: str, now: datetime, *, after_run: bool = False) -> st
 
     if schedule.startswith("daily:"):
         daily_time = _parse_daily_time(schedule.removeprefix("daily:"))
-        local_tz = datetime.now().astimezone().tzinfo
-        local_now = now.astimezone(local_tz)
-        candidate = datetime.combine(local_now.date(), daily_time, tzinfo=local_tz)
+        local_now = now.astimezone(BOT_TIMEZONE)
+        candidate = datetime.combine(local_now.date(), daily_time, tzinfo=BOT_TIMEZONE)
         if candidate <= local_now:
             candidate += timedelta(days=1)
         return _iso(candidate)
@@ -213,7 +239,7 @@ def _parse_iso(value: str) -> datetime:
     except ValueError as exc:
         raise ValueError("once schedule requires an ISO timestamp") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
     return parsed.astimezone(UTC)
 
 

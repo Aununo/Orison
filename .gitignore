@@ -33,3 +33,27 @@ coverage.out
 .idea/
 .vscode/
 
+# docs
+docs
+AGENTS.md
+
+# test
+tests/
+
+# Private configuration and personal memory
+/config.toml
+/memory/
+.env.*
+!.env.example
+
+# Local conversation exports and backups
+*.sqlite3.backup*
+*.sqlite3.bak*
+
+# Private runtime logs and conversation exports
+*.log
+/logs/
+/exports/
+/backups/
+*.db.bak*
+*.db.backup*

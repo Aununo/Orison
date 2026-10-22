@@ -1,54 +1,51 @@
 ---
 name: reminders
-description: Set, list, and cancel time-based reminders for QQ users; default all natural or naive times to Asia/Shanghai and use the reminder tool.
+description: Set, list, and cancel QQ reminders in Asia/Singapore; use reminder for one-time requests and cron for recurring requests.
 ---
 
 # Reminders
 
-Use this skill whenever the user asks things like “提醒我…”, “某个时间叫我…”, “到点告诉我…”, “明天/今晚/半小时后提醒…”.
+Use this skill when the user asks to be reminded or notified at a specific time.
 
 ## Behavior
 
-- Default timezone: `Asia/Shanghai` / 中国上海时间.
-- If the user gives a relative time, resolve it against the current `Asia/Shanghai` time from system context.
-- If the user gives a date/time without timezone, treat it as `Asia/Shanghai`.
-- Preserve the actual reminder content succinctly, without adding extra tasks.
-- In QQ group chats, reminders should notify the requester in the same group and @mention them.
-- Do not implement reminders by promising to remember manually; call the `reminder` tool.
+- Default timezone: `Asia/Singapore` (UTC+08:00, no daylight saving time).
+- Resolve relative times against the current Singapore time in system context.
+- Treat dates without a timezone as Singapore time; honor explicit offsets.
+- Preserve the requested reminder content without adding extra tasks.
+- In QQ group chats, notify the requester in the same group and @mention them.
+- Create one-time reminders with `reminder` and recurring reminders with `cron`.
+- A conversational promise does not create a reminder; confirm creation only after the tool succeeds.
 
-## Tool usage
+## Tool Usage
 
-To create a reminder, call:
-
-```json
-{
-  "action": "add",
-  "message": "要提醒用户做的事",
-  "remind_at": "YYYY-MM-DD HH:MM",
-  "name": "简短提醒名"
-}
-```
-
-`remind_at` should be ISO-like. Examples:
-
-- “今晚 8 点提醒我吃药” → resolve to today's or next valid Shanghai date, `20:00`.
-- “明天上午 9 点半提醒我开会” → `YYYY-MM-DD 09:30` in Shanghai time.
-- “半小时后提醒我看锅” → current Shanghai time plus 30 minutes.
-
-To list reminders, call:
+Create a one-time reminder with `reminder`:
 
 ```json
-{"action": "list"}
+{"action": "add", "message": "Attend the meeting", "remind_at": "YYYY-MM-DD 09:30", "name": "Meeting"}
 ```
 
-To remove a reminder, ask for/identify its `job_id`, then call:
+- "Tonight at 8": choose the next applicable Singapore date at `20:00`.
+- "Tomorrow at 9:30": use tomorrow's Singapore date at `09:30`.
+- "In half an hour": add 30 minutes to the supplied current time.
+
+For "every day at 9", call `cron`:
 
 ```json
-{"action": "remove", "job_id": "cron-..."}
+{"action": "add", "name": "Daily meal", "cron_expr": "0 9 * * *", "message": "Use the message tool to remind this conversation to eat."}
 ```
 
-## User-facing response
+Include the requesting person's QQ ID from context in the scheduled instruction
+when a personal reminder is requested; tell `message` to use its `mentions` argument.
+Use `every_seconds` for interval schedules. Proactive QQ delivery uses OneBot HTTP.
+Confirm a send only after `message` returns a confirmed message ID. A queued or failed
+result is not proof of delivery; do not automatically retry an unconfirmed send.
 
-After creating a reminder, confirm briefly with the user using Shanghai time, e.g.:
+List one-time reminders with `reminder` and recurring jobs with `cron`, using
+`{"action": "list"}`. Remove the identified job through the corresponding tool
+with `{"action": "remove", "job_id": "cron-..."}`.
 
-“好的，我会在上海时间明天 09:30 在群里 @你，提醒你开会。”
+## Confirmation
+
+Confirm the scheduled Singapore date and time, reminder content, and QQ target
+briefly in the user's conversational language.

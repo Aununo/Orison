@@ -33,6 +33,9 @@ ws_url = "ws://127.0.0.1:3001"
 token = "secret"
 allow_from = "100,200"
 share_session_in_channel = true
+
+[family]
+group_id = "303"
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +48,7 @@ share_session_in_channel = true
 	if cfg.Channel.Default != "qq" || cfg.Channel.CoreURL != "http://core.local:8765" {
 		t.Fatalf("unexpected channel config: %#v", cfg.Channel)
 	}
-	if cfg.Channel.QQ.Token != "secret" || !cfg.Channel.QQ.ShareSessionInChannel {
+	if cfg.Channel.QQ.Token != "secret" || !cfg.Channel.QQ.ShareSessionInChannel || cfg.Channel.QQ.FamilyGroupID != "303" {
 		t.Fatalf("unexpected qq config: %#v", cfg.Channel.QQ)
 	}
 }

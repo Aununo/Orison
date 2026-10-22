@@ -21,7 +21,7 @@ type Channel struct {
 
 	conn    *wsConn
 	connMu  sync.Mutex
-	selfID  int64
+	selfID  atomic.Int64
 	echoSeq atomic.Int64
 	pending sync.Map
 	seenMu  sync.Mutex
@@ -88,6 +88,19 @@ func (c *Channel) close() {
 }
 
 func (c *Channel) readLoop(ctx context.Context, handler core.Handler) error {
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	messages := make(chan map[string]any, 64)
+	go func() {
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case payload := <-messages:
+				c.handleMessage(workerCtx, handler, payload)
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -105,7 +118,13 @@ func (c *Channel) readLoop(ctx context.Context, handler core.Handler) error {
 			continue
 		}
 		if payload["post_type"] == "message" {
-			go c.handleMessage(ctx, handler, payload)
+			select {
+			case messages <- payload:
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return fmt.Errorf("QQ incoming message queue is full")
+			}
 		}
 	}
 }
@@ -114,18 +133,24 @@ func (c *Channel) handleMessage(ctx context.Context, handler core.Handler, paylo
 	messageType, _ := payload["message_type"].(string)
 	userID := int64From(payload["user_id"])
 	if selfID := int64From(payload["self_id"]); selfID != 0 {
-		c.selfID = selfID
+		c.selfID.Store(selfID)
 	}
+	selfID := c.selfID.Load()
 	groupID := int64From(payload["group_id"])
+	if messageType == "group" && c.Config.FamilyGroupID != "" && strconv.FormatInt(groupID, 10) != c.Config.FamilyGroupID {
+		return
+	}
 	messageID := int64From(payload["message_id"])
-	if userID == 0 || userID == c.selfID || !c.allowed(userID) {
+	if userID == 0 || userID == selfID || !c.allowed(userID) {
 		return
 	}
 	if c.isDuplicate(messageID) {
 		return
 	}
 
-	text, metadata := parseOneBotMessage(payload)
+	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	text, metadata := parseIncomingMessage(readCtx, payload, c.callAPI, nil)
+	cancel()
 	if strings.TrimSpace(text) == "" {
 		if count, _ := metadata["image_count"].(int); count > 0 {
 			text = "[QQ image message]"
@@ -133,25 +158,33 @@ func (c *Channel) handleMessage(ctx context.Context, handler core.Handler, paylo
 			return
 		}
 	}
-	shouldHandle, normalizedText := shouldHandleQQMessage(messageType, text, metadata, c.selfID)
-	if !shouldHandle {
+	shouldHandle, normalizedText := shouldHandleQQMessage(messageType, text, metadata, selfID)
+	observeOnly := !shouldHandle && messageType == "group" && c.Config.FamilyGroupID != ""
+	if !shouldHandle && !observeOnly {
 		return
 	}
-	text = normalizedText
+	if shouldHandle {
+		text = normalizedText
+	}
 
 	sessionID := qqSessionID(messageType, userID, groupID, c.Config.ShareSessionInChannel)
 	reply := func(replyCtx context.Context, reply string) error {
 		return c.sendReply(replyCtx, messageType, userID, groupID, reply, nil)
 	}
 	msg := core.Message{
-		SessionID: sessionID,
-		Channel:   "qq",
-		UserID:    strconv.FormatInt(userID, 10),
-		Text:      text,
-		Metadata:  metadata,
-		Reply:     reply,
+		SessionID:   sessionID,
+		Channel:     "qq",
+		UserID:      strconv.FormatInt(userID, 10),
+		Text:        text,
+		Metadata:    metadata,
+		ObserveOnly: observeOnly,
+		Reply:       reply,
 		Stream: func(streamCtx context.Context, event core.Event) error {
 			switch event.Type {
+			case "status":
+				if fallback, _ := event.Metadata["provider_fallback"].(bool); fallback && event.Text != "" {
+					return reply(streamCtx, event.Text)
+				}
 			case "tool_use":
 				return reply(streamCtx, formatToolUseEcho(event))
 			case "final":
@@ -164,6 +197,10 @@ func (c *Channel) handleMessage(ctx context.Context, handler core.Handler, paylo
 			}
 			return nil
 		},
+	}
+	if observeOnly {
+		msg.Reply = nil
+		msg.Stream = nil
 	}
 	if err := handler.HandleMessage(ctx, msg); err != nil {
 		log.Printf("qq: handle message failed: %v", err)
@@ -184,7 +221,11 @@ func (c *Channel) callAPI(ctx context.Context, action string, params map[string]
 	if params == nil {
 		req["params"] = map[string]any{}
 	}
-	if err := c.currentConn().writeJSON(req); err != nil {
+	conn := c.currentConn()
+	if conn == nil {
+		return nil, fmt.Errorf("OneBot connection is unavailable")
+	}
+	if err := conn.writeJSON(req); err != nil {
 		return nil, err
 	}
 
@@ -194,6 +235,9 @@ func (c *Channel) callAPI(ctx context.Context, action string, params map[string]
 	case resp := <-ch:
 		if status, _ := resp["status"].(string); status != "" && status != "ok" {
 			return resp, fmt.Errorf("onebot api %s failed: %v", action, resp["wording"])
+		}
+		if code, ok := resp["retcode"]; ok && int64From(code) != 0 {
+			return nil, fmt.Errorf("onebot api %s returned an error", action)
 		}
 		if data, ok := resp["data"].(map[string]any); ok {
 			return data, nil
@@ -406,70 +450,7 @@ func mentionedSelf(metadata map[string]any, selfID int64) bool {
 }
 
 func parseOneBotMessage(payload map[string]any) (string, map[string]any) {
-	metadata := map[string]any{
-		"platform":     "qq",
-		"message_type": payload["message_type"],
-		"message_id":   payload["message_id"],
-		"group_id":     payload["group_id"],
-		"raw_message":  payload["raw_message"],
-	}
-	var parts []string
-	var atQQs []string
-	var images []map[string]any
-	imageCount := 0
-	switch message := payload["message"].(type) {
-	case string:
-		parts = append(parts, message)
-	case []any:
-		for _, raw := range message {
-			seg, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			segType, _ := seg["type"].(string)
-			data, _ := seg["data"].(map[string]any)
-			switch segType {
-			case "text":
-				if data != nil {
-					if text, _ := data["text"].(string); text != "" {
-						parts = append(parts, text)
-					}
-				}
-			case "image":
-				imageCount++
-				if data != nil {
-					image := map[string]any{}
-					for _, key := range []string{"url", "file", "path"} {
-						if value, _ := data[key].(string); value != "" {
-							image[key] = value
-						}
-					}
-					if len(image) > 0 {
-						images = append(images, image)
-					}
-				}
-			case "at":
-				if data != nil {
-					if qq := fmt.Sprint(data["qq"]); qq != "" && qq != "<nil>" {
-						atQQs = append(atQQs, qq)
-					}
-				}
-			}
-		}
-	}
-	if len(parts) == 0 {
-		if rawMessage, _ := payload["raw_message"].(string); rawMessage != "" {
-			parts = append(parts, rawMessage)
-		}
-	}
-	metadata["image_count"] = imageCount
-	if len(images) > 0 {
-		metadata["images"] = images
-	}
-	if len(atQQs) > 0 {
-		metadata["at_qqs"] = atQQs
-	}
-	return strings.TrimSpace(strings.Join(parts, "")), metadata
+	return parseIncomingMessage(context.Background(), payload, nil, nil)
 }
 
 func int64From(value any) int64 {

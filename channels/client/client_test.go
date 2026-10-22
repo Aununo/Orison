@@ -152,7 +152,7 @@ func TestStreamMessageAcceptsLargeImageFinalEvent(t *testing.T) {
 			Type:      "final",
 			SessionID: "local:test",
 			Content:   "生成好了",
-			Metadata: map[string]any{"images": []any{map[string]any{"data": largeImage}}},
+			Metadata:  map[string]any{"images": []any{map[string]any{"data": largeImage}}},
 		})
 	}))
 	defer server.Close()
@@ -179,6 +179,26 @@ func writeSSE(t *testing.T, w http.ResponseWriter, eventName string, event Strea
 		t.Fatal(err)
 	}
 	if _, err := w.Write([]byte("data: " + string(raw) + "\n\n")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSendMessageForwardsObservationFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		if payload["observe_only"] != true {
+			t.Error("observation flag was not forwarded")
+		}
+		_ = json.NewEncoder(w).Encode(MessageResponse{SessionID: "qq:g:303", Response: ""})
+	}))
+	defer server.Close()
+	_, err := New(server.URL).SendMessage(context.Background(), MessageRequest{
+		SessionID: "qq:g:303", Message: "Family chat", ObserveOnly: true,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 }

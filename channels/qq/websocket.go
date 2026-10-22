@@ -153,6 +153,9 @@ func (c *wsConn) readFrame() (byte, []byte, error) {
 		}
 		length = binary.BigEndian.Uint64(b[:])
 	}
+	if length > 8*1024*1024 {
+		return 0, nil, fmt.Errorf("OneBot WebSocket frame exceeds 8 MiB")
+	}
 	var mask [4]byte
 	if masked {
 		if _, err := io.ReadFull(c.br, mask[:]); err != nil {

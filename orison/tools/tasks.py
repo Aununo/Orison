@@ -1,51 +1,15 @@
-"""Task spawning and cron scheduling tools."""
+"""Cron scheduling tool for reminders and recurring activities."""
 
 from __future__ import annotations
 
-import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from orison.tools.base import Tool, object_schema
 from orison.tools.common import _orison_schedule
+from orison.timezone import BOT_TIMEZONE
 
 if TYPE_CHECKING:
     from orison.cron import CronManager
-
-
-class SpawnTool(Tool):
-    def __init__(self, *, cron: CronManager | None = None, session_id: str) -> None:
-        self.cron = cron
-        self.session_id = session_id
-
-    @property
-    def name(self) -> str:
-        return "spawn"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Spawn a background Orison task. In Core this schedules the task as an immediate "
-            "one-shot cron job in an isolated spawn session."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return object_schema({"task": {"type": "string"}, "label": {"type": "string"}}, required=["task"])
-
-    async def execute(self, task: str, label: str | None = None, **_: Any) -> str:
-        if self.cron is None:
-            return "Error: Subagent spawning requires Orison cron runtime"
-        job_id = f"spawn-{uuid.uuid4().hex[:12]}"
-        job = self.cron.create_job(
-            name=label or task[:30],
-            prompt=task,
-            schedule=f"once:{datetime.now(UTC).isoformat()}",
-            target_session=f"{self.session_id}:spawn:{job_id}" if self.session_id else f"spawn:{job_id}",
-            enabled=True,
-            job_id=job_id,
-        )
-        return f"Spawned background task '{job.name}' (id: {job.id})"
 
 
 class CronTool(Tool):
@@ -59,7 +23,11 @@ class CronTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        return (
+            f"Schedule reminders and recurring tasks in {BOT_TIMEZONE.key}. Actions: add, list, remove. "
+            "For proactive reminders, the scheduled message must instruct the message tool to notify this "
+            "conversation and include the requesting person's QQ ID when a mention is needed."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -70,8 +38,8 @@ class CronTool(Tool):
                 "message": {"type": "string"},
                 "every_seconds": {"type": "integer", "minimum": 1},
                 "cron_expr": {"type": "string"},
-                "tz": {"type": "string", "description": "Accepted for nanobot compatibility; Orison daily cron uses server local timezone"},
-                "at": {"type": "string"},
+                "tz": {"type": "string", "description": f"Accepted for nanobot compatibility; Orison daily cron always uses {BOT_TIMEZONE.key}"},
+                "at": {"type": "string", "description": f"ISO date/time; naive values use {BOT_TIMEZONE.key}."},
                 "deliver": {"type": "boolean", "description": "Accepted for nanobot compatibility; Orison stores results in session history"},
                 "job_id": {"type": "string"},
             },

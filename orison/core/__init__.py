@@ -1,10 +1,11 @@
-"""Core orchestration package.
-
-Core owns Orison sessions and context assembly. It talks to providers through
-the provider registry rather than calling any provider-specific CLI directly.
-"""
-"""Core orchestration for Orison."""
-
-from orison.core.session import MessageResult, SessionManager, SessionRecord
+"""Core orchestration, with lazy exports to keep storage imports independent."""
 
 __all__ = ["MessageResult", "SessionManager", "SessionRecord"]
+
+
+def __getattr__(name: str):
+    if name in __all__:
+        from orison.core import session
+
+        return getattr(session, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"orison/channels/client"
 	"orison/channels/core"
@@ -16,6 +17,13 @@ import (
 )
 
 func main() {
+	location, err := time.LoadLocation("Asia/Singapore")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load timezone: %v\n", err)
+		os.Exit(1)
+	}
+	time.Local = location
+
 	configPath := os.Getenv("ORISON_CONFIG")
 	if configPath == "" {
 		configPath = "config.toml"
@@ -33,11 +41,12 @@ func main() {
 	coreClient := client.New(cfg.Channel.CoreURL)
 	handler := core.HandlerFunc(func(ctx context.Context, msg core.Message) error {
 		req := client.MessageRequest{
-			SessionID: msg.SessionID,
-			Message:   msg.Text,
-			Channel:   msg.Channel,
-			UserID:    msg.UserID,
-			Metadata:  msg.Metadata,
+			SessionID:   msg.SessionID,
+			Message:     msg.Text,
+			Channel:     msg.Channel,
+			UserID:      msg.UserID,
+			Metadata:    msg.Metadata,
+			ObserveOnly: msg.ObserveOnly,
 		}
 		if msg.Stream != nil {
 			hadTextDelta := false

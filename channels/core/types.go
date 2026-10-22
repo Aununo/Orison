@@ -3,13 +3,14 @@ package core
 import "context"
 
 type Message struct {
-	SessionID string
-	Channel   string
-	UserID    string
-	Text      string
-	Metadata  map[string]any
-	Reply     ReplyFunc
-	Stream    StreamReplyFunc
+	SessionID   string
+	Channel     string
+	UserID      string
+	Text        string
+	Metadata    map[string]any
+	ObserveOnly bool
+	Reply       ReplyFunc
+	Stream      StreamReplyFunc
 }
 
 type Event struct {

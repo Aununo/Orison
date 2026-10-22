@@ -9,19 +9,19 @@ Use the `todo` tool for stateful, actionable tasks the user wants tracked as a c
 
 ## Use `todo.add` when
 
-- The user says “加个待办”, “创建 todo”, “记一个任务”, “待办一下 …”.
+- The user asks to add a todo, create a task, or track an action item.
 - The request is something to do later, not a stable user preference or project fact.
-- If the user provides a deadline such as “明天晚上前”, store it as `due_at`; do not schedule a reminder unless the user explicitly asks to be reminded.
+- Resolve deadlines such as "by tomorrow evening" in `Asia/Singapore` using the current time from system context. Store them as `due_at`; schedule a reminder only when explicitly requested.
 
 ## Use `todo.list` when
 
-- The user asks “我有哪些待办”, “todo 列表”, “还剩什么任务”.
+- The user asks for their todo list or remaining tasks.
 - Default to open todos for the current user/session scope.
 
 ## Use `todo.done` / `todo.update` / `todo.remove` when
 
 - The user says a task is done, cancelled, renamed, rescheduled, or should be deleted.
-- If the user refers to “第一个/第二个”, list current todos first if the id is ambiguous.
+- If the user refers to the first or second item, list current todos first if the id is ambiguous.
 
 ## Do not confuse with memory or reminders
 

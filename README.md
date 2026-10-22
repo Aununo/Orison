@@ -1,18 +1,33 @@
-# Orison, it's me
+# Orison
 
-Orison is a personal Agent assistant. The goal of the MVP is not to recreate a heavyweight platform, but to build a simple, elegant, everyday personal Agent system that can grow over time:
+Orison is a personal AI companion for family conversations, memory, and everyday tasks.
 
-- Python Core: the Agent orchestration core, including sessions, providers, memory, skills, cron, and dream.
-- Providers: an extensible provider architecture; the MVP only implements `openai-codex`.
-- Go Channels: the message entry layer; the MVP starts with local, HTTP webhook, and QQ (NapCat / OneBot v11).
-- Memory: long-term memory, independent of provider-internal sessions.
-- Skills: a reusable capability library built around `SKILL.md` as the basic unit.
-- Tools: a registered tool layer for exposing reusable actions to the Agent in a controlled way.
-- Loop: the runtime cycle that receives messages, recalls context, selects skills, calls tools, responds, and records useful experience.
-- Dream: controlled reflection and self-learning that only distills memory and skills.
+## Features
 
-## Quick Start(Recommend very strongly)
+- QQ, terminal, and webhook channels; QQ supports merged forwards and images.
+- Shared family context, bounded memory, and forgetting.
+- Daily Dream consolidation at 03:00; all schedules use `Asia/Singapore`.
+- Reminders, recurring notifications, todos, web lookup, and messaging.
+- Primary `openai-codex` provider with DeepSeek API fallback and failure notices.
 
-If you want another Agent assistant (for example Openclaw, Hermes, Claude, or Codex) to install Orison with NapCat/QQ on a user's server, give it this file:
+## Structure
 
-- [`docs/napcat-orison-qq-deploy.md`](docs/napcat-orison-qq-deploy.md)
+- `orison/`: Python Core, providers, memory, tools, and scheduling.
+- `channels/` and `cmd/orison-channel/`: Go transports and channel entry point.
+- `skills/`: reusable companion skills.
+
+## Run Locally
+
+Requires Python 3.11+, Go 1.22+, private `config.toml`, and provider credentials.
+Keep configuration, persona files, credentials, and runtime data out of Git.
+
+```bash
+python3 -m venv .orison/venv
+.orison/venv/bin/python -m pip install -r requirements.txt
+.orison/venv/bin/python -m orison.server
+```
+
+In another terminal, run `ORISON_CHANNEL=local go run ./cmd/orison-channel`.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration, authentication, QQ setup,
+validation, and upgrades.

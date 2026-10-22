@@ -29,12 +29,13 @@ func New(baseURL string) Client {
 }
 
 type MessageRequest struct {
-	SessionID string         `json:"-"`
-	Message   string         `json:"message"`
-	Channel   string         `json:"channel"`
-	UserID    string         `json:"user_id"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	Provider  string         `json:"provider,omitempty"`
+	SessionID   string         `json:"-"`
+	Message     string         `json:"message"`
+	Channel     string         `json:"channel"`
+	UserID      string         `json:"user_id"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	Provider    string         `json:"provider,omitempty"`
+	ObserveOnly bool           `json:"observe_only,omitempty"`
 }
 
 type MessageResponse struct {

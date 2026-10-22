@@ -128,7 +128,7 @@ class ToolRegistry:
         return tool, cast_params, None
 
     async def execute(self, name: str, params: dict[str, Any]) -> Any:
-        hint = "\n\n[Analyze the error above and try a different approach.]"
+        hint = "" if name == "message" else "\n\n[Analyze the error above and try a different approach.]"
         tool, cast_params, error = self.prepare_call(name, params)
         if error:
             return error + hint

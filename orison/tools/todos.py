@@ -5,15 +5,13 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
 
 from orison.tools.base import Tool, object_schema
 from orison.tools.common import _strip_think
+from orison.timezone import BOT_TIMEZONE
 
 if TYPE_CHECKING:
     from orison.core.storage import CoreStorage
-
-_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class TodoTool(Tool):
@@ -42,7 +40,7 @@ class TodoTool(Tool):
                 "id": {"type": "string", "description": "Todo id for done/update/remove."},
                 "title": {"type": "string"},
                 "notes": {"type": "string"},
-                "due_at": {"type": "string", "description": "Optional due date/time, preferably Asia/Shanghai if naive."},
+                "due_at": {"type": "string", "description": f"Optional due date/time; naive values use {BOT_TIMEZONE.key}."},
                 "priority": {"type": "string", "enum": ["low", "normal", "high"]},
                 "status": {"type": "string", "enum": ["open", "done", "cancelled", "all"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -179,14 +177,14 @@ def _normalize_todo_due_at(value: str | None) -> str | None:
     except ValueError as exc:
         raise ValueError("due_at must be an ISO date/time, e.g. 2026-04-27 21:00") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_SHANGHAI_TZ)
-    return parsed.isoformat()
+        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
+    return parsed.astimezone(BOT_TIMEZONE).isoformat()
 
 
 def _format_todos(todos: list[dict[str, Any]]) -> str:
     lines = ["Todos:"]
     for item in todos:
-        due = f", due {item['due_at']}" if item.get("due_at") else ""
+        due = f", due {_normalize_todo_due_at(item['due_at'])} {BOT_TIMEZONE.key}" if item.get("due_at") else ""
         notes = f" — {item['notes']}" if item.get("notes") else ""
         lines.append(f"- {item['id']} [{item['status']}/{item['priority']}{due}] {item['title']}{notes}")
     return "\n".join(lines)

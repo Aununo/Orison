@@ -271,3 +271,90 @@ func TestQQChannelPrivateMessageRoundTripWithOneBotWebSocket(t *testing.T) {
 		t.Fatal("channel did not stop")
 	}
 }
+
+func TestFamilyGroupObservesUnaddressedMessagesWithoutReply(t *testing.T) {
+	channel := New(core.QQConfig{AllowFrom: "101,202", FamilyGroupID: "303", ShareSessionInChannel: true})
+	var captured []core.Message
+	handler := core.HandlerFunc(func(ctx context.Context, msg core.Message) error {
+		captured = append(captured, msg)
+		return nil
+	})
+	payload := map[string]any{
+		"message_type": "group", "group_id": int64(303), "user_id": int64(101),
+		"self_id": int64(999), "message_id": int64(1), "message": "I prefer tea.",
+	}
+	channel.handleMessage(context.Background(), handler, payload)
+	if len(captured) != 1 || !captured[0].ObserveOnly || captured[0].Reply != nil || captured[0].Stream != nil {
+		t.Fatalf("ordinary family chat must be observed silently: %#v", captured)
+	}
+	if captured[0].SessionID != "qq:g:303" || captured[0].Text != "I prefer tea." {
+		t.Fatalf("unexpected observation: %#v", captured[0])
+	}
+	payload["group_id"] = int64(404)
+	payload["message_id"] = int64(2)
+	channel.handleMessage(context.Background(), handler, payload)
+	payload["group_id"] = int64(303)
+	payload["user_id"] = int64(404)
+	payload["message_id"] = int64(3)
+	channel.handleMessage(context.Background(), handler, payload)
+	if len(captured) != 1 {
+		t.Fatal("other groups and unknown senders must not enter family memory")
+	}
+	payload["user_id"] = int64(202)
+	payload["message_id"] = int64(4)
+	payload["message"] = "/ping"
+	channel.handleMessage(context.Background(), handler, payload)
+	if len(captured) != 2 || captured[1].ObserveOnly || captured[1].Reply == nil {
+		t.Fatal("addressed messages must retain normal replies")
+	}
+}
+
+func TestQQStreamSendsFallbackNoticeBeforeFinalReply(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	channel := New(core.QQConfig{AllowFrom: "123"})
+	channel.conn = &wsConn{conn: clientConn, br: bufio.NewReader(clientConn)}
+	server := &wsConn{conn: serverConn, br: bufio.NewReader(serverConn)}
+	requests := make(chan map[string]any, 2)
+	serverErr := make(chan error, 1)
+	go func() {
+		for i := 0; i < 2; i++ {
+			var request map[string]any
+			if err := server.readJSON(&request); err != nil {
+				serverErr <- err
+				return
+			}
+			requests <- request
+			if pending, ok := channel.pending.Load(request["echo"]); ok {
+				pending.(chan map[string]any) <- map[string]any{"status": "ok"}
+			}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	handler := core.HandlerFunc(func(ctx context.Context, msg core.Message) error {
+		if err := msg.Stream(ctx, core.Event{Type: "status", Text: "Internal status"}); err != nil {
+			return err
+		}
+		if err := msg.Stream(ctx, core.Event{Type: "status", Text: "Primary unavailable; switching to DeepSeek.", Metadata: map[string]any{"provider_fallback": true}}); err != nil {
+			return err
+		}
+		return msg.Stream(ctx, core.Event{Type: "final", Text: "Backup reply"})
+	})
+	channel.handleMessage(ctx, handler, map[string]any{
+		"message_type": "private", "self_id": int64(999), "user_id": int64(123), "message_id": int64(1), "message": "Hello",
+	})
+	for _, want := range []string{"Primary unavailable; switching to DeepSeek.", "Backup reply"} {
+		select {
+		case request := <-requests:
+			if request["action"] != "send_private_msg" || request["params"].(map[string]any)["message"] != want {
+				t.Fatalf("unexpected delivery: %#v; want %q", request, want)
+			}
+		case err := <-serverErr:
+			t.Fatal(err)
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for fallback notification")
+		}
+	}
+}

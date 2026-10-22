@@ -35,6 +35,7 @@ type QQConfig struct {
 	Token                 string
 	AllowFrom             string
 	ShareSessionInChannel bool
+	FamilyGroupID         string
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -98,6 +99,8 @@ func LoadConfig(path string) (Config, error) {
 			case "share_session_in_channel":
 				cfg.Channel.QQ.ShareSessionInChannel = parseBool(value)
 			}
+		case section == "family" && key == "group_id":
+			cfg.Channel.QQ.FamilyGroupID = parseString(value)
 		case strings.HasPrefix(section, "providers."):
 			name := strings.TrimPrefix(section, "providers.")
 			provider := cfg.Providers[name]

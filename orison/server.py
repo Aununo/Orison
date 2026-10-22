@@ -7,15 +7,19 @@ import ipaddress
 import json
 import logging
 import os
+import sqlite3
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from orison.config import OrisonConfig, load_config
+from orison.limits import StorageLimitError
 from orison.core import SessionManager, SessionRecord
-from orison.cron import cron_job_payload, cron_run_payload
+from orison.cron import DEFAULT_DREAM_SCHEDULE, cron_job_payload, cron_run_payload
 from orison.providers.registry import ProviderRegistry, build_provider_registry
+from orison.timezone import BOT_TIMEZONE
 
 
 logger = logging.getLogger(__name__)
@@ -138,6 +142,9 @@ class OrisonHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
+            except StorageLimitError as exc:
+                self._send_json({"error": str(exc)}, status=507)
+                return
 
             self._send_json({"section": memory_section, "content": appended}, status=201)
             return
@@ -169,6 +176,9 @@ class OrisonHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "provider must be a string"}, status=400)
                 return
 
+            observe_only = payload.get("observe_only", False)
+            if not isinstance(observe_only, bool):
+                raise ValueError("observe_only must be a boolean")
             result = self.server.manager.send_message(  # type: ignore[attr-defined]
                 session_id,
                 message,
@@ -176,12 +186,22 @@ class OrisonHandler(BaseHTTPRequestHandler):
                 user_id=user_id,
                 metadata=metadata,
                 provider_name=provider,
+                observe_only=observe_only,
             )
         except json.JSONDecodeError:
             self._send_json({"error": "request body must be JSON"}, status=400)
             return
         except (KeyError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=400)
+            return
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, status=403)
+            return
+        except StorageLimitError as exc:
+            self._send_json({"error": str(exc)}, status=507)
+            return
+        except sqlite3.OperationalError as exc:
+            self._send_json({"error": str(exc)}, status=507 if "full" in str(exc).lower() else 500)
             return
 
         self._send_json(
@@ -255,6 +275,8 @@ class OrisonHandler(BaseHTTPRequestHandler):
                     self._send_sse(event.type, _provider_event_payload(session_id, event))
             except (BrokenPipeError, ConnectionResetError):
                 return
+            except (StorageLimitError, PermissionError, ValueError, sqlite3.OperationalError) as exc:
+                self._send_sse("error", {"type": "error", "session_id": session_id, "content": str(exc), "error": str(exc)})
 
         asyncio.run(write_stream())
         self.close_connection = True
@@ -327,8 +349,8 @@ class OrisonHandler(BaseHTTPRequestHandler):
             if provider is not None and not isinstance(provider, str):
                 self._send_json({"error": "provider must be a string"}, status=400)
                 return
-            limit = payload.get("limit", 50)
-            if not isinstance(limit, int):
+            limit = payload.get("limit", 200)
+            if not isinstance(limit, int) or isinstance(limit, bool):
                 self._send_json({"error": "limit must be an integer"}, status=400)
                 return
             result = self.server.manager.run_dream(provider_name=provider, limit=limit)  # type: ignore[attr-defined]
@@ -337,6 +359,9 @@ class OrisonHandler(BaseHTTPRequestHandler):
             return
         except (KeyError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=400)
+            return
+        except StorageLimitError as exc:
+            self._send_json({"error": str(exc)}, status=507)
             return
 
         self._send_json({"dream": result.as_dict()}, status=500 if result.error else 200)
@@ -394,7 +419,7 @@ def build_server(
     port: int = 8765,
 ) -> ThreadingHTTPServer:
     registry = registry or build_provider_registry(config)
-    manager = manager or SessionManager(data_dir=config.data_dir, registry=registry)
+    manager = manager or SessionManager(data_dir=config.data_dir, registry=registry, family=config.family)
     server = OrisonHTTPServer((host, port), OrisonHandler)
     server.api_token = os.environ.get("ORISON_API_TOKEN", "").strip()  # type: ignore[attr-defined]
     server.max_body_bytes = _max_body_bytes_from_env()  # type: ignore[attr-defined]
@@ -404,13 +429,16 @@ def build_server(
     server.manager = manager  # type: ignore[attr-defined]
     if os.environ.get("ORISON_DREAM_DAILY", "1") != "0":
         manager.ensure_daily_dream_cron(
-            schedule=os.environ.get("ORISON_DREAM_DAILY_SCHEDULE", "daily:03:00"),
+            schedule=os.environ.get("ORISON_DREAM_DAILY_SCHEDULE", DEFAULT_DREAM_SCHEDULE),
         )
     _start_cron_scheduler(server)
     return server
 
 
 def main() -> None:
+    os.environ["TZ"] = BOT_TIMEZONE.key
+    if hasattr(time, "tzset"):
+        time.tzset()
     logging.basicConfig(
         level=os.environ.get("ORISON_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -556,6 +584,7 @@ def _start_cron_scheduler(server: OrisonHTTPServer) -> None:
             try:
                 server.manager.run_due_cron_jobs_once()  # type: ignore[attr-defined]
             except Exception:
+                logger.exception("Scheduled maintenance failed")
                 continue
 
     thread = threading.Thread(target=loop, name="orison-cron", daemon=True)

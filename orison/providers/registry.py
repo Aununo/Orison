@@ -8,6 +8,7 @@ from typing import Callable
 from orison.config import OrisonConfig, ProviderConfig
 from orison.providers.base import Provider
 from orison.providers.deepseek import DeepSeekProvider
+from orison.providers.failover import FailoverProvider
 from orison.providers.kimi import KimiProvider
 from orison.providers.local_openai_compatible import LocalOpenAICompatibleProvider
 from orison.providers.openai import OpenAIProvider
@@ -30,6 +31,7 @@ PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
 class ProviderRegistry:
     default_name: str
     providers: dict[str, Provider]
+    fallback_name: str | None = None
 
     def default(self) -> Provider:
         if self.default_name not in self.providers:
@@ -45,6 +47,12 @@ class ProviderRegistry:
     def names(self) -> list[str]:
         return sorted(self.providers)
 
+    def for_run(self, name: str | None = None) -> Provider:
+        primary = self.get(name)
+        if primary.name == self.default_name and self.fallback_name:
+            return FailoverProvider(primary, self.get(self.fallback_name))
+        return primary
+
 
 def build_provider_registry(config: OrisonConfig) -> ProviderRegistry:
     providers: dict[str, Provider] = {}
@@ -53,4 +61,4 @@ def build_provider_registry(config: OrisonConfig) -> ProviderRegistry:
         if factory is None:
             raise ValueError(f"Unsupported provider: {name}")
         providers[name] = factory(provider_config)
-    return ProviderRegistry(default_name=config.default_provider, providers=providers)
+    return ProviderRegistry(default_name=config.default_provider, providers=providers, fallback_name=config.fallback_provider)

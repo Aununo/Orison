@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager, nullcontext
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from orison import limits
 
 
 class CoreStorage:
@@ -13,9 +17,10 @@ class CoreStorage:
 
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db_path = self.data_dir / "orison.sqlite3"
         self._init_schema()
+        self.db_path.chmod(0o600)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -30,7 +35,24 @@ class CoreStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def merge_family_sessions(self, group_id: str, member_ids: list[str]) -> None:
+        canonical = f"qq:g:{group_id}"
+        with self.transaction() as db:
+            for member_id in member_ids:
+                old_id = f"qq:{group_id}:{member_id}"
+                row = db.execute("SELECT * FROM sessions WHERE session_id=?", (old_id,)).fetchone()
+                if row is None:
+                    continue
+                db.execute(
+                    "INSERT OR IGNORE INTO sessions VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                    (canonical, row["provider_name"], row["channel"], row["user_id"], row["created_at"], row["updated_at"]),
+                )
+                for table in ("messages", "provider_runs", "provider_events"):
+                    db.execute(f"UPDATE {table} SET session_id=? WHERE session_id=?", (canonical, old_id))
+                db.execute("DELETE FROM sessions WHERE session_id=?", (old_id,))
+
     def upsert_session(self, session: dict[str, Any]) -> None:
+        limits.ensure_storage_capacity(self.data_dir, 4096)
         with self._connect() as db:
             db.execute(
                 """
@@ -64,6 +86,22 @@ class CoreStorage:
         metadata: dict[str, Any],
         created_at: str,
     ) -> None:
+        limits.ensure_storage_capacity(self.data_dir, len(user_message.encode()) + len(final_response.encode()) + 32768)
+        final_response = limits.clip_text(final_response, limits.MAX_MESSAGE_BYTES)
+        metadata = limits.compact_payload(metadata)
+        if len(_json(metadata).encode()) > 16384:
+            metadata = {key: metadata[key] for key in ("group_id", "message_id", "speaker_id", "role", "name", "timestamp", "observe_only") if key in metadata}
+        events, size = [], 0
+        for event in provider_events[-100:]:
+            event = limits.compact_payload(event)
+            encoded = _json(event)
+            if len(encoded.encode()) > 4096:
+                event = {"type": event.get("type", ""), "detail": limits.clip_text(encoded, 3500)}
+            size += len(_json(event).encode())
+            if size > 65536:
+                break
+            events.append(event)
+        provider_events = events
         with self._connect() as db:
             db.execute(
                 """
@@ -229,6 +267,88 @@ class CoreStorage:
             }
             for row in rows
         ]
+
+    def conversation_runs(
+        self, *, session_id: str | None = None, after: str | None = None,
+        pending_only: bool = False, newest: bool = False, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if after:
+            timestamp, run_id = json.loads(after)
+            clauses.append("(created_at, run_id) > (?, ?)")
+            params.extend((timestamp, run_id))
+        if pending_only:
+            clauses.append("dream_processed = 0")
+        direction = "DESC" if newest else "ASC"
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT * FROM provider_runs WHERE {' AND '.join(clauses) or '1'} "
+                f"ORDER BY created_at {direction}, run_id {direction} LIMIT ?",
+                (*params, max(1, min(limit, 1000))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            result.append(item)
+        return list(reversed(result)) if newest else result
+
+    def get_conversation_summary(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM conversation_summaries WHERE session_id = ?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_conversation_summary(self, session_id: str, content: str, state: dict[str, Any], through: str, now: str) -> None:
+        limits.ensure_storage_capacity(self.data_dir, 8192)
+        with self.transaction() as db:
+            previous = db.execute("SELECT through_cursor FROM conversation_summaries WHERE session_id=?", (session_id,)).fetchone()
+            if previous and tuple(json.loads(previous["through_cursor"])) >= tuple(json.loads(through)):
+                return
+            db.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET content=excluded.content, state_json=excluded.state_json, "
+                "through_cursor=excluded.through_cursor, updated_at=excluded.updated_at",
+                (session_id, content, _json(state), through, now),
+            )
+
+    @contextmanager
+    def transaction(self):
+        db = self._connect()
+        try:
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+        finally:
+            db.close()
+
+    def maintain(self, *, now: datetime | None = None) -> dict[str, int]:
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=14)).isoformat()
+        debug_cutoff = (now - timedelta(days=3)).isoformat()
+        month_cutoff = (now - timedelta(days=30)).isoformat()
+        with self.transaction() as db:
+            db.execute("DELETE FROM provider_events WHERE created_at < ?", (debug_cutoff,))
+            db.execute("DELETE FROM memory_events WHERE created_at < ?", (month_cutoff,))
+            db.execute("DELETE FROM dream_runs WHERE completed_at < ?", (month_cutoff,))
+            db.execute("DELETE FROM daily_summaries WHERE updated_at < ?", (month_cutoff,))
+            db.execute("CREATE TEMP TABLE retired_runs AS SELECT run_id FROM provider_runs WHERE dream_processed = 1 AND created_at < ?", (cutoff,))
+            db.execute("DELETE FROM provider_events WHERE run_id IN (SELECT run_id FROM retired_runs)")
+            db.execute("DELETE FROM messages WHERE id IN (SELECT run_id || ':user' FROM retired_runs UNION SELECT run_id || ':assistant' FROM retired_runs)")
+            retired = db.execute("DELETE FROM provider_runs WHERE run_id IN (SELECT run_id FROM retired_runs)").rowcount
+            db.execute("DROP TABLE retired_runs")
+        for path in (self.data_dir / "dream" / "changelog").glob("*.md"):
+            if not path.is_symlink() and path.stat().st_mtime < (now - timedelta(days=30)).timestamp():
+                path.unlink()
+        with self._connect() as db:
+            free = db.execute("PRAGMA freelist_count").fetchone()[0]
+            pages = db.execute("PRAGMA page_count").fetchone()[0]
+            # Reuse free pages normally; shrink only when substantial space is unused.
+            if pages > 256 and free > pages // 4 and limits.runtime_size(self.data_dir) + self.db_path.stat().st_size * 2 < limits.STORAGE_BYTES:
+                db.execute("VACUUM")
+        return {"retired_runs": retired}
 
     def insert_memory_event(
         self,
@@ -461,8 +581,9 @@ class CoreStorage:
         raw_response: str,
         started_at: str,
         completed_at: str,
+        db: sqlite3.Connection | None = None,
     ) -> None:
-        with self._connect() as db:
+        with (nullcontext(db) if db is not None else self._connect()) as db:
             db.execute(
                 """
                 INSERT INTO dream_runs (
@@ -512,9 +633,11 @@ class CoreStorage:
         return records
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.db_path)
+        db = sqlite3.connect(self.db_path, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
+        page_size = db.execute("PRAGMA page_size").fetchone()[0]
+        db.execute(f"PRAGMA max_page_count = {max(1, limits.STORAGE_BYTES // page_size)}")
         return db
 
     def _init_schema(self) -> None:
@@ -577,6 +700,53 @@ class CoreStorage:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    memory_key TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    importance REAL NOT NULL,
+                    half_life_days REAL NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT,
+                    sources_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(scope, subject, memory_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, subject);
+
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    session_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    through_cursor TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS daily_summaries (
+                    scope TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope, day)
+                );
+                CREATE TABLE IF NOT EXISTS memory_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS memory_tombstones (
+                    scope TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    forgotten_at TEXT NOT NULL,
+                    PRIMARY KEY(scope, subject, memory_key)
+                );
+
                 CREATE TABLE IF NOT EXISTS todos (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL DEFAULT '',
@@ -630,6 +800,11 @@ class CoreStorage:
                 """
             )
             self._ensure_todos_constraints(db)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(provider_runs)")}
+            if "dream_processed" not in columns:
+                db.execute("ALTER TABLE provider_runs ADD COLUMN dream_processed INTEGER NOT NULL DEFAULT 0")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_runs_pending ON provider_runs(dream_processed, created_at, run_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_runs_session ON provider_runs(session_id, created_at, run_id)")
 
     def _ensure_todos_constraints(self, db: sqlite3.Connection) -> None:
         row = db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'todos'").fetchone()

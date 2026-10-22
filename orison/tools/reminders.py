@@ -3,24 +3,22 @@
 from __future__ import annotations
 
 import json
-import os
-import urllib.error
-import urllib.request
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from orison.limits import ensure_storage_capacity
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
 
 from orison.tools.base import Tool, object_schema
 from orison.tools.common import _strip_think
+from orison.tools.onebot import OneBotDeliveryError, send_qq_message
+from orison.timezone import BOT_TIMEZONE
 
 if TYPE_CHECKING:
     from orison.cron import CronManager
 
 
 REMINDER_PROMPT_PREFIX = "orison://reminder/"
-_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class ReminderTool(Tool):
@@ -37,7 +35,7 @@ class ReminderTool(Tool):
     def description(self) -> str:
         return (
             "Schedule QQ reminders. Use this when the user asks to be reminded at a specific time. "
-            "Interpret relative/natural times in Asia/Shanghai unless the user explicitly says another timezone. "
+            f"Interpret relative/natural times in {BOT_TIMEZONE.key} unless the user explicitly says another timezone. "
             "For QQ group requests, the reminder will @mention the requesting user in the same group. "
             "Actions: add, list, remove."
         )
@@ -51,7 +49,7 @@ class ReminderTool(Tool):
                 "message": {"type": "string", "description": "What to remind the user to do."},
                 "remind_at": {
                     "type": "string",
-                    "description": "ISO-like date/time for the reminder. If no offset is present, it is Asia/Shanghai time.",
+                    "description": f"ISO-like date/time for the reminder. If no offset is present, it is {BOT_TIMEZONE.key} time.",
                 },
                 "job_id": {"type": "string"},
             },
@@ -83,7 +81,7 @@ class ReminderTool(Tool):
         if not remind_at or not remind_at.strip():
             return "Error: remind_at is required when action='add'"
         try:
-            run_at_utc = _parse_shanghai_datetime(remind_at)
+            run_at_utc = _parse_reminder_datetime(remind_at)
         except ValueError as exc:
             return f"Error: {exc}"
 
@@ -94,13 +92,13 @@ class ReminderTool(Tool):
             created_at=datetime.now(UTC),
         )
         job = self.cron.create_job(
-            name=name or f"提醒：{message[:24]}",
+            name=name or f"Reminder: {message[:24]}",
             prompt=encode_reminder_prompt(payload),
             schedule=f"once:{run_at_utc.isoformat()}",
             target_session=self.session_id,
             enabled=True,
         )
-        return f"Created reminder '{job.name}' (id: {job.id}) for {run_at_utc.astimezone(_SHANGHAI_TZ).isoformat()} Asia/Shanghai"
+        return f"Created reminder '{job.name}' (id: {job.id}) for {run_at_utc.astimezone(BOT_TIMEZONE).isoformat()} {BOT_TIMEZONE.key}"
 
 
 def encode_reminder_prompt(payload: dict[str, Any]) -> str:
@@ -121,26 +119,25 @@ def deliver_reminder_prompt(prompt: str, *, data_dir: Path) -> tuple[str, str | 
     if payload.get("channel") != "qq":
         return f"Queued reminder at {outbox_file}", None
 
-    url = os.environ.get("ORISON_ONEBOT_HTTP_URL", "http://127.0.0.1:15150").rstrip("/")
     action, params = _onebot_reminder_request(payload)
     if not action:
         return f"Queued reminder at {outbox_file}", "reminder has no valid QQ target"
     try:
-        body = json.dumps(params, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            f"{url}/{action}",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            response_text = resp.read().decode("utf-8", "replace")
-        return f"Sent QQ reminder via {action}; queued copy at {outbox_file}; response: {response_text}", None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        group = action == "send_group_msg"
+        message = params["message"]
+        if isinstance(message, str):
+            message = [{"type": "text", "data": {"text": message}}]
+        message_id = send_qq_message("group" if group else "private", str(params["group_id" if group else "user_id"]), message)
+    except (OneBotDeliveryError, OSError) as exc:
         return f"Queued reminder at {outbox_file}", f"failed to send QQ reminder: {exc}"
+    try:
+        outbox_file.unlink()
+    except OSError:
+        return f"Sent QQ reminder (message_id: {message_id}); pending outbox cleanup failed; do not resend", None
+    return f"Sent QQ reminder (message_id: {message_id})", None
 
 
-def _parse_shanghai_datetime(value: str) -> datetime:
+def _parse_reminder_datetime(value: str) -> datetime:
     clean = value.strip().replace(" ", "T", 1)
     if clean.endswith("Z"):
         clean = clean[:-1] + "+00:00"
@@ -149,7 +146,7 @@ def _parse_shanghai_datetime(value: str) -> datetime:
     except ValueError as exc:
         raise ValueError("remind_at must be an ISO date/time, e.g. 2026-04-27 09:30") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_SHANGHAI_TZ)
+        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
     return parsed.astimezone(UTC)
 
 
@@ -173,10 +170,13 @@ def _reminder_payload(
 
 
 def _write_reminder_outbox(payload: dict[str, Any], *, data_dir: Path) -> Path:
+    ensure_storage_capacity(data_dir, len(json.dumps(payload).encode()) + 4096)
     outbox = data_dir / "reminders_outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
+    outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
     outbox_file = outbox / f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid.uuid4().hex[:8]}.json"
-    outbox_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with outbox_file.open("x", encoding="utf-8") as record:
+        outbox_file.chmod(0o600)
+        record.write(json.dumps(payload, ensure_ascii=False, indent=2))
     return outbox_file
 
 
@@ -185,7 +185,7 @@ def _onebot_reminder_request(payload: dict[str, Any]) -> tuple[str, dict[str, An
     user_id = str(payload.get("user_id") or "").strip()
     group_id = str(payload.get("group_id") or "").strip()
     message_type = str(payload.get("message_type") or "").strip()
-    text = f" 提醒：{message}" if message else " 提醒时间到了"
+    text = f" Reminder: {message}" if message else " Reminder time"
     if message_type == "group" and group_id and user_id:
         return "send_group_msg", {
             "group_id": group_id,
