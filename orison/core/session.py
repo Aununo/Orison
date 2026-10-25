@@ -392,7 +392,8 @@ class SessionManager:
             await asyncio.to_thread(self.context.prepare, session_id, provider, self.family)
             messages = self.context.messages(session_id, ProviderMessage(role="user", content=clean_message,
                 metadata={**_message_multimodal_metadata(context_metadata), **ConversationContext.speaker(user_id, context_metadata["timestamp"], self.family)}), self.family)
-            system_context = self._build_system_context(
+            system_context = await asyncio.to_thread(
+                self._build_system_context,
                 context_metadata,
                 user_message=clean_message,
                 provider=provider,
@@ -535,7 +536,8 @@ class SessionManager:
         await asyncio.to_thread(self.context.prepare, session.session_id, provider, self.family)
         messages = self.context.messages(session.session_id, ProviderMessage(role="user", content=user_message,
             metadata={**_message_multimodal_metadata(metadata), **ConversationContext.speaker(str(metadata["user_id"]), metadata["timestamp"], self.family)}), self.family)
-        system_context = self._build_system_context(
+        system_context = await asyncio.to_thread(
+            self._build_system_context,
             metadata,
             user_message=user_message,
             provider=provider,

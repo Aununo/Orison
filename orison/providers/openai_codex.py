@@ -233,7 +233,8 @@ class OpenAICodexProvider:
         if self.config.reasoning_effort:
             body["reasoning"] = {"effort": self.config.reasoning_effort}
         if self.config.service_tier:
-            body["service_tier"] = self.config.service_tier
+            # The Codex OAuth endpoint still requires the legacy name for Fast mode.
+            body["service_tier"] = "priority" if self.config.service_tier == "fast" else self.config.service_tier
         return body
 
 
