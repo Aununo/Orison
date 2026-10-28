@@ -6,6 +6,7 @@ Orison is a personal AI companion for family conversations, memory, and everyday
 
 - QQ, terminal, and webhook channels; QQ supports merged forwards and images.
 - Shared family context, bounded memory, and forgetting.
+- Optional, rate-limited spontaneous replies when the family group conversation pauses.
 - Daily Dream consolidation at 03:00; all schedules use `Asia/Singapore`.
 - Reminders, recurring notifications, todos, web lookup, and messaging.
 - Primary `openai-codex` provider with DeepSeek API fallback and failure notices.

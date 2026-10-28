@@ -296,6 +296,19 @@ class CoreStorage:
             result.append(item)
         return list(reversed(result)) if newest else result
 
+    def user_run_activity(self, session_id: str, user_id: str, *, since: str) -> tuple[int, str | None]:
+        """Count a speaker's runs since a UTC timestamp and return their latest run time."""
+        with self._connect() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM provider_runs WHERE session_id = ? AND user_id = ? AND created_at >= ?",
+                (session_id, user_id, since),
+            ).fetchone()[0]
+            latest = db.execute(
+                "SELECT MAX(created_at) FROM provider_runs WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            ).fetchone()[0]
+        return count, latest
+
     def get_conversation_summary(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM conversation_summaries WHERE session_id = ?", (session_id,)).fetchone()

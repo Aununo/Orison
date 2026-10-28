@@ -39,6 +39,12 @@ class SkillRegistry:
             return "No skills found."
         return "\n".join(skill.summary_line() for skill in skills)
 
+    def context_within(self, max_bytes: int) -> str | None:
+        """Return every skill's context, or None when the full set exceeds max_bytes."""
+        skills = self.list_skills()
+        context = self.context_for_names([skill.name for skill in skills], max_skills=len(skills))
+        return context if len(context.encode("utf-8")) <= max_bytes else None
+
     def context_for_names(self, names: list[str], *, max_skills: int = 2) -> str:
         selected: list[Skill] = []
         seen: set[str] = set()

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +27,28 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class SpontaneousConfig:
+    """Occasional unprompted replies in the family group; disabled unless configured."""
+
+    enabled: bool = False
+    probability: float = 0.2
+    cooldown_minutes: int = 30
+    daily_max: int = 3
+    quiet_hours: str = "23:00-08:00"
+    settle_seconds: int = 60
+
+    def quiet_window(self) -> tuple[time, time] | None:
+        return parse_quiet_hours(self.quiet_hours)
+
+
+@dataclass(frozen=True)
 class OrisonConfig:
     data_dir: str
     default_provider: str
     providers: dict[str, ProviderConfig]
     family: dict[str, Any] = field(default_factory=dict)
     fallback_provider: str | None = None
+    spontaneous: SpontaneousConfig = field(default_factory=SpontaneousConfig)
 
 
 def load_config(path: str | Path = "config.toml") -> OrisonConfig:
@@ -75,12 +93,50 @@ def load_config(path: str | Path = "config.toml") -> OrisonConfig:
         raise ValueError("provider.fallback must name a configured provider different from the primary")
 
     orison_section = _require_dict(raw, "orison")
+    family = _load_family(raw.get("family", {}))
     return OrisonConfig(
         data_dir=_require_str(orison_section, "data_dir"),
         default_provider=default_provider,
         providers=providers,
-        family=_load_family(raw.get("family", {})),
+        family=family,
         fallback_provider=fallback_provider,
+        spontaneous=_load_spontaneous(raw.get("family", {}).get("spontaneous", {})),
+    )
+
+
+def parse_quiet_hours(value: str) -> tuple[time, time] | None:
+    """Parse "HH:MM-HH:MM" in the bot timezone; an empty value disables quiet hours."""
+    if not value:
+        return None
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)", value)
+    if not match:
+        raise ValueError("family.spontaneous.quiet_hours must look like 23:00-08:00")
+    start, end = time(int(match[1]), int(match[2])), time(int(match[3]), int(match[4]))
+    return None if start == end else (start, end)
+
+
+def _load_spontaneous(value: Any) -> SpontaneousConfig:
+    if not isinstance(value, dict):
+        raise ValueError("family.spontaneous must be a TOML table")
+    defaults = SpontaneousConfig()
+    probability = value.get("probability", defaults.probability)
+    if isinstance(probability, bool) or not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
+        raise ValueError("family.spontaneous.probability must be a number from 0 to 1")
+    counts = {}
+    for key in ("cooldown_minutes", "daily_max", "settle_seconds"):
+        count = value.get(key, getattr(defaults, key))
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"family.spontaneous.{key} must be a non-negative integer")
+        counts[key] = count
+    quiet_hours = value.get("quiet_hours", defaults.quiet_hours)
+    if not isinstance(quiet_hours, str):
+        raise ValueError("family.spontaneous.quiet_hours must be a string")
+    parse_quiet_hours(quiet_hours)
+    return SpontaneousConfig(
+        enabled=_optional_bool(value.get("enabled", False), "family.spontaneous.enabled"),
+        probability=float(probability),
+        quiet_hours=quiet_hours,
+        **counts,
     )
 
 

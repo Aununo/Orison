@@ -21,6 +21,8 @@ Required behavior:
 - Use `Asia/Singapore` for dates and schedules. Dream runs daily at `03:00`.
 - Observe allowed family members in the configured group silently; reply when
   mentioned or sent `/ping`. Allowed private conversations do not require mentions.
+  When `family.spontaneous` is enabled, the companion may occasionally join a paused
+  family group conversation unprompted; it never does so in private conversations.
 
 The [OpenAI Fast mode documentation](https://developers.openai.com/api/docs/guides/fast-mode)
 defines `service_tier="fast"`. DeepSeek documents the V4.1 Flash API ID in its
@@ -85,6 +87,7 @@ Inspect values locally without dumping the entire file. Required fields are:
 | `channels.qq.share_session_in_channel` | `true` |
 | `family.group_id` | Operator-provided family group ID, stored as a string |
 | `family.father` / `family.mother` | Tables containing distinct string `user_id` values and English `name` values; optional `native_name` |
+| `family.spontaneous` | Optional; disabled unless `enabled = true`. Also `probability` (default `0.2`), `cooldown_minutes` (`30`), `daily_max` (`3`), `quiet_hours` (`"23:00-08:00"`, Singapore time; `""` disables) and `settle_seconds` (`60`) |
 
 Keep the sender allowlist consistent with the family member mappings. Store native
 names with Unicode escapes when needed. Preserve English project instructions and

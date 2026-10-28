@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 import threading
 import weakref
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,19 @@ from orison.memory import MarkdownMemoryStore, MemorySnapshot
 from orison.providers import Provider, ProviderMessage, ProviderRegistry, ProviderRequest
 from orison.providers.base import ProviderEvent, ToolCallRequest
 from orison.core.rules import resolve_builtin_response
+from orison.core.spontaneous import (
+    SPONTANEOUS_EXCLUDED_TOOLS,
+    SPONTANEOUS_GUIDANCE,
+    SPONTANEOUS_MESSAGE,
+    SPONTANEOUS_USER_ID,
+    SpontaneousGate,
+    is_silent,
+)
+from orison.config import SpontaneousConfig
 from orison.skills import SkillRegistry
 from orison.tools import build_default_tool_registry
+from orison.tools.common import _strip_think
+from orison.tools.onebot import OneBotDeliveryError, send_qq_message
 from orison.tools.reminders import REMINDER_PROMPT_PREFIX, deliver_reminder_prompt
 from orison.timezone import BOT_TIMEZONE
 
@@ -48,7 +60,8 @@ class MessageResult:
     run_id: str
 
 
-_MAX_TOOL_ITERATIONS = 8
+_MAX_TOOL_ITERATIONS = 40
+_logger = logging.getLogger(__name__)
 
 
 class SessionManager:
@@ -61,9 +74,11 @@ class SessionManager:
         memory_dir: str | Path = "memory",
         skills_dir: str | Path = "skills",
         family: dict[str, Any] | None = None,
+        spontaneous: SpontaneousConfig | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.family = family or {}
+        self.spontaneous = SpontaneousGate(spontaneous or SpontaneousConfig())
         self._locks = weakref.WeakValueDictionary()
         self._locks_guard = threading.Lock()
         self.registry = registry
@@ -100,12 +115,15 @@ class SessionManager:
                 self._locks[session_id] = lock
             return lock
 
-    def _incoming(self, session_id: str, message: str, channel: str, user_id: str, metadata: dict[str, Any] | None):
+    def _incoming(self, session_id: str, message: str, channel: str, user_id: str,
+                  metadata: dict[str, Any] | None, observe_only: bool = False):
         if not isinstance(message, str) or not message.strip() or len(message.encode()) > limits.MAX_MESSAGE_BYTES:
             raise ValueError(f"Message must contain 1 to {limits.MAX_MESSAGE_BYTES} UTF-8 bytes")
         metadata = dict(metadata or {})
         for key in ("role", "name", "native_name", "observe_only"):
             metadata.pop(key, None)
+        if observe_only:
+            metadata["observe_only"] = True
         if channel == "qq" and str(metadata.get("group_id") or "") == self.family.get("group_id"):
             if user_id not in self.family.get("members", {}):
                 raise PermissionError("Only configured family members may write to this conversation")
@@ -124,21 +142,22 @@ class SessionManager:
     def send_message(self, session_id: str, message: str, *, channel: str, user_id: str,
                      metadata: dict[str, Any] | None = None, provider_name: str | None = None,
                      observe_only: bool = False) -> MessageResult:
-        session_id, metadata = self._incoming(session_id, message, channel, user_id, metadata)
+        session_id, metadata = self._incoming(session_id, message, channel, user_id, metadata, observe_only)
         with self._session_lock(session_id):
-            if observe_only:
-                metadata["observe_only"] = True
-            return self._send_message(session_id, message, channel=channel, user_id=user_id,
-                                      metadata=metadata, provider_name=provider_name)
+            result = asyncio.run(self._collect_turn(session_id, message, channel=channel, user_id=user_id,
+                                                    metadata=metadata, provider_name=provider_name))
+        self._note_family_activity(session_id, addressed=not observe_only)
+        return result
 
     async def stream_message(self, session_id: str, message: str, *, channel: str, user_id: str,
-                             metadata: dict[str, Any] | None = None, provider_name: str | None = None):
-        session_id, metadata = self._incoming(session_id, message, channel, user_id, metadata)
+                             metadata: dict[str, Any] | None = None, provider_name: str | None = None,
+                             observe_only: bool = False):
+        session_id, metadata = self._incoming(session_id, message, channel, user_id, metadata, observe_only)
         lock = self._session_lock(session_id)
         while not lock.acquire(blocking=False):
             await asyncio.sleep(0.02)
-        stream = self._stream_message(session_id, message, channel=channel, user_id=user_id,
-                                      metadata=metadata, provider_name=provider_name)
+        stream = self._run_turn(session_id, message, channel=channel, user_id=user_id,
+                                metadata=metadata, provider_name=provider_name)
         try:
             async for event in stream:
                 yield event
@@ -147,129 +166,32 @@ class SessionManager:
                 await stream.aclose()
             finally:
                 lock.release()
+                self._note_family_activity(session_id, addressed=not observe_only)
 
-    def _send_message(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        channel: str,
-        user_id: str,
-        metadata: dict[str, Any] | None = None,
-        provider_name: str | None = None,
-    ) -> MessageResult:
-        clean_message = message.strip()
-        if not clean_message:
-            raise ValueError("message must be a non-empty string")
-
-        metadata = dict(metadata or {})
-        builtin_response = "" if metadata.get("observe_only") else resolve_builtin_response(clean_message)
-        now = _now()
-        existing = self.get_session(session_id)
-        selected_provider_name = provider_name or (existing.provider_name if existing else self.registry.default_name)
-        if builtin_response is not None:
-            session = existing or SessionRecord(
-                session_id=session_id,
-                provider_name=selected_provider_name,
-                provider_session_id=None,
-                channel=channel,
-                user_id=user_id,
-                created_at=now,
-                updated_at=now,
-            )
-            updated_session = SessionRecord(
-                session_id=session.session_id,
-                provider_name=selected_provider_name,
-                provider_session_id=session.provider_session_id,
-                channel=channel or session.channel,
-                user_id=user_id or session.user_id,
-                created_at=session.created_at,
-                updated_at=_now(),
-            )
-            self.storage.upsert_session(asdict(updated_session))
-            run_id = self._write_run_record(
-                updated_session,
-                user_message=clean_message,
-                result_content=builtin_response,
-                error=None,
-                provider_events=[],
-                metadata={
-                    **metadata,
-                    "channel": channel,
-                    "user_id": user_id,
-                    "provider": selected_provider_name,
-                    "session_id": session_id,
-                    "builtin_rule": True,
-                },
-            )
-            return MessageResult(
-                session=updated_session,
-                response=builtin_response,
-                error=None,
-                provider_session_id=updated_session.provider_session_id,
-                run_id=run_id,
-            )
-        provider = self.registry.for_run(selected_provider_name)
-
-        session = existing or SessionRecord(
-            session_id=session_id,
-            provider_name=selected_provider_name,
-            provider_session_id=None,
-            channel=channel,
-            user_id=user_id,
-            created_at=now,
-            updated_at=now,
-        )
-
-        context_metadata = {
-            **metadata,
-            "channel": channel,
-            "user_id": user_id,
-            "provider": selected_provider_name,
-            "session_id": session_id,
-        }
-        result_content, result_error, provider_session_id, provider_events = asyncio.run(
-            self._run_message_flow(
-                provider,
-                session,
-                selected_provider_name,
-                clean_message,
-                context_metadata,
-            )
-        )
-        notices = [event["content"] for event in provider_events
-                   if event.get("type") == "status" and event.get("metadata", {}).get("provider_fallback")]
-        response_content = "\n\n".join([*notices, result_content or result_error or ""]) if notices else result_content
-        context_metadata["active_provider"] = provider.name
-
-        updated_session = SessionRecord(
-            session_id=session.session_id,
-            provider_name=selected_provider_name,
-            provider_session_id=provider_session_id or session.provider_session_id,
-            channel=channel or session.channel,
-            user_id=user_id or session.user_id,
-            created_at=session.created_at,
-            updated_at=_now(),
-        )
-        self.storage.upsert_session(asdict(updated_session))
-        run_id = self._write_run_record(
-            updated_session,
-            user_message=clean_message,
-            result_content=result_content,
-            error=result_error,
-            provider_events=provider_events,
-            metadata=context_metadata,
-        )
-
+    async def _collect_turn(self, session_id: str, message: str, **kwargs: Any) -> MessageResult:
+        """Run one turn without a streaming consumer and fold its events into a single result."""
+        notices: list[str] = []
+        terminal: ProviderEvent | None = None
+        async for event in self._run_turn(session_id, message, **kwargs):
+            if event.type == "status" and event.metadata.get("provider_fallback") and event.content:
+                notices.append(event.content)
+            elif event.type in {"final", "error"}:
+                terminal = event
+        assert terminal is not None, "a turn always ends with a final or error event"
+        error = terminal.error if terminal.type == "error" else None
+        content = terminal.content if terminal.type == "final" else ""
+        response = "\n\n".join([*notices, content or error or ""]) if notices else content
+        session = self.get_session(session_id)
+        assert session is not None, "a completed turn always persists its session"
         return MessageResult(
-            session=updated_session,
-            response=response_content,
-            error=result_error,
-            provider_session_id=updated_session.provider_session_id,
-            run_id=run_id,
+            session=session,
+            response=response,
+            error=error,
+            provider_session_id=session.provider_session_id,
+            run_id=str(terminal.metadata.get("run_id") or ""),
         )
 
-    async def _stream_message(
+    async def _run_turn(
         self,
         session_id: str,
         message: str,
@@ -279,59 +201,15 @@ class SessionManager:
         metadata: dict[str, Any] | None = None,
         provider_name: str | None = None,
     ):
+        """Run one conversation turn, yielding normalized events and persisting exactly one run record."""
         clean_message = message.strip()
         if not clean_message:
             raise ValueError("message must be a non-empty string")
 
         metadata = dict(metadata or {})
-        builtin_response = resolve_builtin_response(clean_message)
         now = _now()
         existing = self.get_session(session_id)
         selected_provider_name = provider_name or (existing.provider_name if existing else self.registry.default_name)
-        if builtin_response is not None:
-            session = existing or SessionRecord(
-                session_id=session_id,
-                provider_name=selected_provider_name,
-                provider_session_id=None,
-                channel=channel,
-                user_id=user_id,
-                created_at=now,
-                updated_at=now,
-            )
-            updated_session = SessionRecord(
-                session_id=session.session_id,
-                provider_name=selected_provider_name,
-                provider_session_id=session.provider_session_id,
-                channel=channel or session.channel,
-                user_id=user_id or session.user_id,
-                created_at=session.created_at,
-                updated_at=_now(),
-            )
-            self.storage.upsert_session(asdict(updated_session))
-            run_id = self._write_run_record(
-                updated_session,
-                user_message=clean_message,
-                result_content=builtin_response,
-                error=None,
-                provider_events=[],
-                metadata={
-                    **metadata,
-                    "channel": channel,
-                    "user_id": user_id,
-                    "provider": selected_provider_name,
-                    "session_id": session_id,
-                    "builtin_rule": True,
-                },
-            )
-            yield ProviderEvent(
-                type="final",
-                content=builtin_response,
-                provider_session_id=updated_session.provider_session_id,
-                metadata={"run_id": run_id, "builtin_rule": True},
-            )
-            return
-        provider = self.registry.for_run(selected_provider_name)
-
         session = existing or SessionRecord(
             session_id=session_id,
             provider_name=selected_provider_name,
@@ -341,7 +219,6 @@ class SessionManager:
             created_at=now,
             updated_at=now,
         )
-
         context_metadata = {
             **metadata,
             "channel": channel,
@@ -349,44 +226,49 @@ class SessionManager:
             "provider": selected_provider_name,
             "session_id": session_id,
         }
-        if session.provider_session_id:
-            context_metadata["provider_session_id"] = session.provider_session_id
 
+        def persist(content: str, error: str | None, provider_session_id: str | None,
+                    events: list[dict[str, Any]]) -> tuple[SessionRecord, str]:
+            updated = replace(
+                session,
+                provider_name=selected_provider_name,
+                provider_session_id=provider_session_id,
+                channel=channel or session.channel,
+                user_id=user_id or session.user_id,
+                updated_at=_now(),
+            )
+            self.storage.upsert_session(asdict(updated))
+            run_id = self._write_run_record(
+                updated,
+                user_message=clean_message,
+                result_content=content,
+                error=error,
+                provider_events=events,
+                metadata=context_metadata,
+            )
+            return updated, run_id
+
+        # Observed group messages are recorded as history without a reply or model call.
+        builtin_response = "" if metadata.get("observe_only") else resolve_builtin_response(clean_message)
+        if builtin_response is not None:
+            context_metadata["builtin_rule"] = True
+            updated_session, run_id = persist(builtin_response, None, session.provider_session_id, [])
+            yield ProviderEvent(
+                type="final",
+                content=builtin_response,
+                provider_session_id=updated_session.provider_session_id,
+                metadata={"run_id": run_id, "builtin_rule": True},
+            )
+            return
+        provider = self.registry.for_run(selected_provider_name)
+
+        spontaneous = bool(context_metadata.get("spontaneous"))
         provider_events: list[dict[str, Any]] = []
         final_content = ""
         error: str | None = None
         current_provider_session_id = session.provider_session_id
-        persisted = False
         run_id = ""
-        updated_session = session
         last_terminal_event: ProviderEvent | None = None
-
-        def persist_run() -> str:
-            nonlocal final_content, persisted, run_id, updated_session
-            if persisted:
-                return run_id
-            updated_session = SessionRecord(
-                session_id=session.session_id,
-                provider_name=selected_provider_name,
-                provider_session_id=current_provider_session_id,
-                channel=channel or session.channel,
-                user_id=user_id or session.user_id,
-                created_at=session.created_at,
-                updated_at=_now(),
-            )
-            self.storage.upsert_session(asdict(updated_session))
-            final_content = final_content.strip()
-            context_metadata["active_provider"] = provider.name
-            run_id = self._write_run_record(
-                updated_session,
-                user_message=clean_message,
-                result_content=final_content,
-                error=error,
-                provider_events=provider_events,
-                metadata=context_metadata,
-            )
-            persisted = True
-            return run_id
 
         try:
             await asyncio.to_thread(self.context.prepare, session_id, provider, self.family)
@@ -407,7 +289,10 @@ class SessionManager:
                 context_metadata=context_metadata,
                 family=self.family,
             )
-            for iteration in range(_MAX_TOOL_ITERATIONS):
+            if spontaneous:
+                for name in SPONTANEOUS_EXCLUDED_TOOLS:
+                    tools.unregister(name)
+            for _ in range(_MAX_TOOL_ITERATIONS):
                 request_metadata = dict(context_metadata)
                 if current_provider_session_id:
                     request_metadata["provider_session_id"] = current_provider_session_id
@@ -500,7 +385,27 @@ class SessionManager:
             provider_events.append(_provider_event_record(event))
         finally:
             error = error or _message_delivery_error(provider_events)
-            persist_run()
+            final_content = final_content.strip()
+            context_metadata["active_provider"] = provider.name
+            if not spontaneous:
+                _, run_id = persist(final_content, error, current_provider_session_id, provider_events)
+
+        if spontaneous:
+            # An unprompted turn leaves no history unless the reply is actually delivered.
+            reply = _strip_think(final_content)
+            final_content = ""
+            if not error and not is_silent(reply):
+                try:
+                    message_id = await asyncio.to_thread(
+                        send_qq_message, "group", str(context_metadata.get("group_id") or ""),
+                        [{"type": "text", "data": {"text": reply}}],
+                    )
+                except OneBotDeliveryError as exc:
+                    error = f"Spontaneous reply was not delivered: {exc}"
+                else:
+                    context_metadata["message_id"] = message_id
+                    final_content = reply
+                    _, run_id = persist(reply, None, current_provider_session_id, provider_events)
 
         if error:
             yield ProviderEvent(
@@ -520,129 +425,6 @@ class SessionManager:
             provider_session_id=current_provider_session_id,
             metadata=final_metadata,
         )
-
-    async def _run_message_flow(
-        self,
-        provider: Provider,
-        session: SessionRecord,
-        provider_name: str,
-        user_message: str,
-        metadata: dict[str, Any],
-        *,
-        event_sink: Any | None = None,
-        provider_events: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, str | None, str | None, list[dict[str, Any]]]:
-        events = provider_events if provider_events is not None else []
-        await asyncio.to_thread(self.context.prepare, session.session_id, provider, self.family)
-        messages = self.context.messages(session.session_id, ProviderMessage(role="user", content=user_message,
-            metadata={**_message_multimodal_metadata(metadata), **ConversationContext.speaker(str(metadata["user_id"]), metadata["timestamp"], self.family)}), self.family)
-        system_context = await asyncio.to_thread(
-            self._build_system_context,
-            metadata,
-            user_message=user_message,
-            provider=provider,
-        )
-        tools = build_default_tool_registry(
-            data_dir=self.data_dir,
-            storage=self.storage,
-            cron=self.cron,
-            memory_store=self.memory_store,
-            session_id=session.session_id,
-            context_metadata=metadata,
-            family=self.family,
-        )
-        current_provider_session_id = session.provider_session_id
-        final_content = ""
-        error: str | None = None
-
-        async def record(event: ProviderEvent) -> None:
-            events.append(_provider_event_record(event))
-            if event_sink is not None:
-                await event_sink(event)
-
-        for iteration in range(_MAX_TOOL_ITERATIONS):
-            request_metadata = dict(metadata)
-            if current_provider_session_id:
-                request_metadata["provider_session_id"] = current_provider_session_id
-            request = ProviderRequest(
-                messages=list(messages),
-                system_context=system_context,
-                session_id=session.session_id,
-                workspace=str(self._provider_workdir(provider)),
-                tools=tools.get_definitions(),
-                metadata=request_metadata,
-            )
-            if current_provider_session_id:
-                result = await asyncio.to_thread(provider.resume_session, current_provider_session_id, request)
-            else:
-                result = await asyncio.to_thread(provider.start_session, request)
-            current_provider_session_id = result.provider_session_id or current_provider_session_id
-            events.extend(result.raw_events)
-            if result.error:
-                error = result.error
-                await record(
-                    ProviderEvent(
-                        type="error",
-                        content=error,
-                        provider_session_id=current_provider_session_id,
-                        error=error,
-                    )
-                )
-                return final_content, error, current_provider_session_id, events
-
-            final_content = result.content
-            if not result.should_execute_tools:
-                return final_content, _message_delivery_error(events), current_provider_session_id, events
-
-            assistant_tool_calls = [tool_call.to_openai_tool_call() for tool_call in result.tool_calls]
-            messages.append(
-                ProviderMessage(
-                    role="assistant",
-                    content=result.content or "",
-                    metadata={"tool_calls": assistant_tool_calls},
-                )
-            )
-            await record(
-                ProviderEvent(
-                    type="tool_use",
-                    content=", ".join(tool_call.name for tool_call in result.tool_calls),
-                    provider_session_id=current_provider_session_id,
-                    metadata={"tool_calls": assistant_tool_calls, "iteration": iteration},
-                )
-            )
-
-            for tool_call in result.tool_calls:
-                output = await tools.execute(tool_call.name, tool_call.arguments)
-                output_text = _tool_result_text(output)
-                messages.append(
-                    ProviderMessage(
-                        role="tool",
-                        content=output_text,
-                        metadata={"tool_call_id": tool_call.id, "name": tool_call.name},
-                    )
-                )
-                await record(
-                    ProviderEvent(
-                        type="tool_result",
-                        content=output_text,
-                        provider_session_id=current_provider_session_id,
-                        metadata={"tool_name": tool_call.name, "tool_success": not output_text.startswith("Error")},
-                    )
-                )
-
-        error = (
-            f"I reached the maximum number of tool call iterations ({_MAX_TOOL_ITERATIONS}) "
-            "before producing a final answer."
-        )
-        await record(
-            ProviderEvent(
-                type="error",
-                content=error,
-                provider_session_id=current_provider_session_id,
-                error=error,
-            )
-        )
-        return final_content or error, error, current_provider_session_id, events
 
     @staticmethod
     def _provider_workdir(provider: Provider) -> Path:
@@ -745,6 +527,61 @@ class SessionManager:
             job_id="dream-daily",
         )
 
+    def run_spontaneous_once(self, now: datetime | None = None) -> str | None:
+        """Consider one unprompted family group reply; return the delivered text, if any."""
+        group_id = self.family.get("group_id")
+        if not self.spontaneous.config.enabled or not group_id:
+            return None
+        now = now or datetime.now(UTC)
+        if not self.spontaneous.take_due(now):
+            return None
+        session_id = "qq:g:" + group_id
+        midnight = datetime.combine(now.astimezone(BOT_TIMEZONE).date(), time(), tzinfo=BOT_TIMEZONE)
+        replies_today, latest = self.storage.user_run_activity(
+            session_id, SPONTANEOUS_USER_ID, since=midnight.astimezone(UTC).isoformat(),
+        )
+        reason = self.spontaneous.skip_reason(
+            now, last_reply_at=datetime.fromisoformat(latest) if latest else None, replies_today=replies_today,
+        )
+        if reason:
+            _logger.debug("Spontaneous reply skipped: %s", reason)
+            return None
+        lock = self._session_lock(session_id)
+        # A requested reply in progress takes priority; this pause is simply skipped.
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            limits.ensure_storage_capacity(self.data_dir, 128 * 1024)
+            return asyncio.run(self._spontaneous_turn(session_id, group_id, now))
+        finally:
+            lock.release()
+
+    async def _spontaneous_turn(self, session_id: str, group_id: str, now: datetime) -> str | None:
+        metadata = {
+            **ConversationContext.speaker(SPONTANEOUS_USER_ID, now.isoformat(), self.family),
+            "group_id": group_id,
+            "message_type": "group",
+            "spontaneous": True,
+            "session_id": session_id,
+            "user_id": SPONTANEOUS_USER_ID,
+        }
+        terminal: ProviderEvent | None = None
+        async for event in self._run_turn(session_id, SPONTANEOUS_MESSAGE, channel="qq",
+                                          user_id=SPONTANEOUS_USER_ID, metadata=metadata):
+            if event.type in {"final", "error"}:
+                terminal = event
+        if terminal is None or terminal.type == "error":
+            _logger.warning("Spontaneous reply failed: %s", terminal.error if terminal else "no result")
+            return None
+        if terminal.content:
+            _logger.info("Spontaneous reply delivered in the family group")
+        return terminal.content or None
+
+    def _note_family_activity(self, session_id: str, *, addressed: bool) -> None:
+        group_id = self.family.get("group_id")
+        if group_id and session_id == "qq:g:" + group_id:
+            self.spontaneous.record(addressed=addressed, at=datetime.now(UTC))
+
     def _build_system_context(
         self,
         metadata: dict[str, Any],
@@ -775,14 +612,16 @@ If a detail is missing or uncertain, acknowledge that instead of inventing conti
 Earlier turns may be outside the recent window. Search memory with English keywords when older details matter.
 Use tools when an action requires them, while keeping ordinary family conversation natural.
 Write persisted memory in English. Reply in the family's conversational language.""",
+            # Stable blocks come first so providers can reuse the cached prompt prefix across turns.
+            _fenced_block("family_members", json.dumps(self.family, ensure_ascii=True)),
+            _fenced_block("skills_summary", skills_summary),
+            _fenced_block("relevant_skills", relevant_skills) if relevant_skills else "",
             f"Current time in {BOT_TIMEZONE.key}: {datetime.now(BOT_TIMEZONE).isoformat()}. "
             "Use this timezone for today, tomorrow, reminders, deadlines, and daily memories unless explicitly specified otherwise.",
             _fenced_block("recalled_context", self.memory_store.context(query=user_message, scope=str(metadata.get("session_id") or "global"), subject=str(metadata.get("user_id") or ""))),
-            _fenced_block("family_members", json.dumps(self.family, ensure_ascii=True)),
             _fenced_block("conversation_summary", self.context.summary_context(str(metadata.get("session_id") or ""))),
-            _fenced_block("skills_summary", skills_summary),
-            _fenced_block("relevant_skills", relevant_skills) if relevant_skills else "",
             _fenced_block("channel_metadata", json.dumps({key: value for key, value in metadata.items() if key not in {"user_message", "raw_message", "images", "run_id"}}, ensure_ascii=True, sort_keys=True)),
+            _fenced_block("spontaneous_turn", SPONTANEOUS_GUIDANCE) if metadata.get("spontaneous") else "",
         ]
         return "\n\n".join(part for part in parts if part.strip())
 
@@ -801,7 +640,13 @@ Write persisted memory in English. Reply in the family's conversational language
         provider: Provider | None,
         max_skills: int = 2,
     ) -> str:
-        if provider is None or skills_summary == "No skills found.":
+        if skills_summary == "No skills found.":
+            return ""
+        # A small skill set is cheaper to include whole than to route with an extra model call.
+        inline = self.skill_registry.context_within(limits.SKILL_CONTEXT_BYTES)
+        if inline is not None:
+            return inline
+        if provider is None:
             return ""
 
         router_prompt = (

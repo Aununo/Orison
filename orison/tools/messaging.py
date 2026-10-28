@@ -67,7 +67,8 @@ class MessageTool(Tool):
                 "media": {"type": "array", "maxItems": 4, "items": {"type": "string"},
                           "description": "Public image URLs or image data URIs; local file paths are not allowed."},
                 "mentions": {"type": "array", "maxItems": 8, "items": {"type": "string"},
-                             "description": "Known family member QQ IDs to mention in this group; never all."},
+                             "description": "Known family member QQ IDs to mention in this group; never all. "
+                                            "Mentions are placed before content automatically; do not repeat @name in content."},
             },
             required=["content"],
         )
@@ -85,7 +86,11 @@ class MessageTool(Tool):
         if mentions and (self.channel != "qq" or self.message_type != "group" or
                          any(not re.fullmatch(r"[1-9][0-9]{0,19}", member) or member not in self.allowed_mentions for member in mentions)):
             return "Error: only known members of the current group may be mentioned"
-        segments = [{"type": "at", "data": {"qq": member}} for member in mentions]
+        segments = []
+        for member in mentions:
+            # QQ renders an at segment as "@nickname" without a trailing space.
+            segments.append({"type": "at", "data": {"qq": member}})
+            segments.append({"type": "text", "data": {"text": " "}})
         if content:
             segments.append({"type": "text", "data": {"text": content}})
         try:

@@ -68,3 +68,9 @@ func TestLocalChannelStreamsDeltasWithoutDuplicatingFinal(t *testing.T) {
 		t.Fatalf("final response duplicated or missing (%d): %q", count, out.String())
 	}
 }
+
+func TestCompactKeepsUTF8Valid(t *testing.T) {
+	if got := compact("工具调用结果非常长需要截断", 6); got != "工具调..." {
+		t.Fatalf("unexpected compact text: %q", got)
+	}
+}

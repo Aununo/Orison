@@ -221,7 +221,7 @@ class OpenAICodexProvider:
             "input": input_items,
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(instructions, messages),
+            "prompt_cache_key": _prompt_cache_key(request),
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
@@ -463,6 +463,9 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "name": name,
                 "description": fn.get("description") or "",
                 "parameters": parameters,
+                # Responses may normalize omitted strict into all-required fields.
+                # Preserve optional arguments unless the tool explicitly opts in.
+                "strict": fn.get("strict") is True,
             }
         )
     return converted
@@ -505,13 +508,11 @@ def _strip_model_prefix(model: str) -> str:
     return model
 
 
-def _prompt_cache_key(instructions: str, messages: list[ProviderMessage]) -> str:
-    raw = json.dumps(
-        {"instructions": instructions, "messages": [message.__dict__ for message in messages]},
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def _prompt_cache_key(request: ProviderRequest) -> str:
+    # The key routes requests that share a prompt prefix to the same cache, so it must stay
+    # stable across turns of one conversation instead of hashing per-request content.
+    purpose = str(request.metadata.get("orison_internal") or "conversation")
+    return hashlib.sha256(f"orison:{purpose}:{request.session_id or ''}".encode("utf-8")).hexdigest()
 
 
 def _response_id(raw: dict[str, Any]) -> str | None:
@@ -540,8 +541,9 @@ def _looks_like_auth_error(exc: Exception) -> bool:
 
 def _auth_error_message(exc: Exception) -> str:
     return (
-        "Codex OAuth authentication failed. Run `nanobot provider login openai-codex` "
-        "or install/login with oauth-cli-kit; Orison uses the OAuth token file, not `codex exec`. "
+        "Codex OAuth authentication failed. Sign in again with oauth-cli-kit "
+        "(`login_oauth_interactive`) as the Core service account and the same "
+        "OAUTH_CLI_KIT_TOKEN_PATH; Orison uses the OAuth token file, not `codex exec`. "
         f"Details: {exc}"
     )
 

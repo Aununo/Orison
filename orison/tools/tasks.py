@@ -38,9 +38,9 @@ class CronTool(Tool):
                 "message": {"type": "string"},
                 "every_seconds": {"type": "integer", "minimum": 1},
                 "cron_expr": {"type": "string"},
-                "tz": {"type": "string", "description": f"Accepted for nanobot compatibility; Orison daily cron always uses {BOT_TIMEZONE.key}"},
+                "tz": {"type": "string", "description": f"Accepted for compatibility; Orison daily cron always uses {BOT_TIMEZONE.key}"},
                 "at": {"type": "string", "description": f"ISO date/time; naive values use {BOT_TIMEZONE.key}."},
-                "deliver": {"type": "boolean", "description": "Accepted for nanobot compatibility; Orison stores results in session history"},
+                "deliver": {"type": "boolean", "description": "Accepted for compatibility; Orison stores results in session history"},
                 "job_id": {"type": "string"},
             },
             required=["action"],
@@ -60,13 +60,17 @@ class CronTool(Tool):
         **_: Any,
     ) -> str:
         if action == "list":
-            jobs = self.cron.list_jobs()
+            jobs = [job for job in self.cron.list_jobs() if job.target_session == self.session_id]
             if not jobs:
                 return "No scheduled jobs."
             return "Scheduled jobs:\n" + "\n".join(f"- {job.name} (id: {job.id}, {job.schedule})" for job in jobs)
         if action == "remove":
             if not job_id:
                 return "Error: job_id is required for remove"
+            # Jobs from other conversations and internal jobs are reported as missing, not exposed.
+            job = self.cron.get_job(job_id)
+            if job is None or job.target_session != self.session_id:
+                return f"Job {job_id} not found"
             return f"Removed job {job_id}" if self.cron.delete_job(job_id) else f"Job {job_id} not found"
         if action != "add":
             return f"Error: unknown action {action!r}"

@@ -90,17 +90,9 @@ func (c *Channel) close() {
 func (c *Channel) readLoop(ctx context.Context, handler core.Handler) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	messages := make(chan map[string]any, 64)
-	go func() {
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case payload := <-messages:
-				c.handleMessage(workerCtx, handler, payload)
-			}
-		}
-	}()
+	dispatch := newDispatcher(workerCtx, maxConcurrentConversations, func(ctx context.Context, payload map[string]any) {
+		c.handleMessage(ctx, handler, payload)
+	})
 	for {
 		select {
 		case <-ctx.Done():
@@ -118,12 +110,9 @@ func (c *Channel) readLoop(ctx context.Context, handler core.Handler) error {
 			continue
 		}
 		if payload["post_type"] == "message" {
-			select {
-			case messages <- payload:
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				return fmt.Errorf("QQ incoming message queue is full")
+			// Dropping one message keeps the connection, and every other conversation, alive.
+			if !dispatch.enqueue(conversationKey(payload), payload) {
+				log.Printf("qq: dropped message %v: conversation queue is full", payload["message_id"])
 			}
 		}
 	}
@@ -402,15 +391,17 @@ func formatQQReply(text string) string {
 	return strings.TrimSpace(text)
 }
 
+// compactForQQ limits text to limit characters without splitting a UTF-8 sequence.
 func compactForQQ(text string, limit int) string {
 	text = strings.TrimSpace(text)
-	if len(text) <= limit {
+	runes := []rune(text)
+	if len(runes) <= limit {
 		return text
 	}
 	if limit <= 3 {
-		return text[:limit]
+		return string(runes[:limit])
 	}
-	return text[:limit-3] + "..."
+	return string(runes[:limit-3]) + "..."
 }
 
 func shouldHandleQQMessage(messageType string, text string, metadata map[string]any, selfID int64) (bool, string) {

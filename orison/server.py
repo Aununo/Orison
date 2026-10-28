@@ -32,9 +32,10 @@ class OrisonHTTPServer(ThreadingHTTPServer):
         stop = getattr(self, "cron_stop", None)
         if isinstance(stop, threading.Event):
             stop.set()
-        thread = getattr(self, "cron_thread", None)
-        if isinstance(thread, threading.Thread):
-            thread.join(timeout=2)
+        for name in ("cron_thread", "spontaneous_thread"):
+            thread = getattr(self, name, None)
+            if isinstance(thread, threading.Thread):
+                thread.join(timeout=2)
         super().server_close()
 
 
@@ -249,6 +250,9 @@ class OrisonHandler(BaseHTTPRequestHandler):
             if provider is not None and not isinstance(provider, str):
                 self._send_json({"error": "provider must be a string"}, status=400)
                 return
+            observe_only = payload.get("observe_only", False)
+            if not isinstance(observe_only, bool):
+                raise ValueError("observe_only must be a boolean")
         except json.JSONDecodeError:
             self._send_json({"error": "request body must be JSON"}, status=400)
             return
@@ -271,6 +275,7 @@ class OrisonHandler(BaseHTTPRequestHandler):
                     user_id=user_id,
                     metadata=metadata,
                     provider_name=provider,
+                    observe_only=observe_only,
                 ):
                     self._send_sse(event.type, _provider_event_payload(session_id, event))
             except (BrokenPipeError, ConnectionResetError):
@@ -419,7 +424,8 @@ def build_server(
     port: int = 8765,
 ) -> ThreadingHTTPServer:
     registry = registry or build_provider_registry(config)
-    manager = manager or SessionManager(data_dir=config.data_dir, registry=registry, family=config.family)
+    manager = manager or SessionManager(data_dir=config.data_dir, registry=registry, family=config.family,
+                                        spontaneous=config.spontaneous)
     server = OrisonHTTPServer((host, port), OrisonHandler)
     server.api_token = os.environ.get("ORISON_API_TOKEN", "").strip()  # type: ignore[attr-defined]
     server.max_body_bytes = _max_body_bytes_from_env()  # type: ignore[attr-defined]
@@ -587,10 +593,21 @@ def _start_cron_scheduler(server: OrisonHTTPServer) -> None:
                 logger.exception("Scheduled maintenance failed")
                 continue
 
+    def spontaneous_loop() -> None:
+        # Separate from cron so a slow model turn never delays reminders.
+        while not stop.wait(5):
+            try:
+                server.manager.run_spontaneous_once()  # type: ignore[attr-defined]
+            except Exception:
+                logger.exception("Spontaneous reply check failed")
+
     thread = threading.Thread(target=loop, name="orison-cron", daemon=True)
+    spontaneous_thread = threading.Thread(target=spontaneous_loop, name="orison-spontaneous", daemon=True)
     server.cron_stop = stop  # type: ignore[attr-defined]
     server.cron_thread = thread  # type: ignore[attr-defined]
+    server.spontaneous_thread = spontaneous_thread  # type: ignore[attr-defined]
     thread.start()
+    spontaneous_thread.start()
 
 
 if __name__ == "__main__":

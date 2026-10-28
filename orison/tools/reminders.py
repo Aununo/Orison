@@ -15,7 +15,7 @@ from orison.tools.onebot import OneBotDeliveryError, send_qq_message
 from orison.timezone import BOT_TIMEZONE
 
 if TYPE_CHECKING:
-    from orison.cron import CronManager
+    from orison.cron import CronJob, CronManager
 
 
 REMINDER_PROMPT_PREFIX = "orison://reminder/"
@@ -66,13 +66,17 @@ class ReminderTool(Tool):
         **_: Any,
     ) -> str:
         if action == "list":
-            jobs = [job for job in self.cron.list_jobs() if job.prompt.startswith(REMINDER_PROMPT_PREFIX)]
+            jobs = [job for job in self.cron.list_jobs() if self._owns(job)]
             if not jobs:
                 return "No reminders."
             return "Reminders:\n" + "\n".join(f"- {job.name} (id: {job.id}, {job.schedule})" for job in jobs)
         if action == "remove":
             if not job_id:
                 return "Error: job_id is required for remove"
+            # Reminders from other conversations are reported as missing, not exposed.
+            job = self.cron.get_job(job_id)
+            if job is None or not self._owns(job):
+                return f"Reminder {job_id} not found"
             return f"Removed reminder {job_id}" if self.cron.delete_job(job_id) else f"Reminder {job_id} not found"
         if action != "add":
             return f"Error: unknown action {action!r}"
@@ -99,6 +103,9 @@ class ReminderTool(Tool):
             enabled=True,
         )
         return f"Created reminder '{job.name}' (id: {job.id}) for {run_at_utc.astimezone(BOT_TIMEZONE).isoformat()} {BOT_TIMEZONE.key}"
+
+    def _owns(self, job: CronJob) -> bool:
+        return job.prompt.startswith(REMINDER_PROMPT_PREFIX) and job.target_session == self.session_id
 
 
 def encode_reminder_prompt(payload: dict[str, Any]) -> str:

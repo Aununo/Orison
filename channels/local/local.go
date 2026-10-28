@@ -142,13 +142,15 @@ func compactEventText(event core.Event) string {
 	return event.Type
 }
 
+// compact limits text to limit characters without splitting a UTF-8 sequence.
 func compact(text string, limit int) string {
 	text = strings.TrimSpace(text)
-	if len(text) <= limit {
+	runes := []rune(text)
+	if len(runes) <= limit {
 		return text
 	}
 	if limit <= 3 {
-		return text[:limit]
+		return string(runes[:limit])
 	}
-	return text[:limit-3] + "..."
+	return string(runes[:limit-3]) + "..."
 }
