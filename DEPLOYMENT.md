@@ -14,10 +14,15 @@ messages and reminders through a separate OneBot HTTP connection.
 
 Required behavior:
 
-- Primary: `openai-codex`, model `gpt-6.1-sol`, reasoning `high`, service tier `fast`.
-- Backup: DeepSeek V4.1 Flash, API model ID `deepseek-flash`.
-- On primary failure, explain the failure and continue through DeepSeek. Try the
-  primary again on the next turn; preserve context and completed tool results.
+- Primary: DeepSeek V4.1 Flash, API model ID `deepseek-flash`.
+- Backup: `openai-codex`, model `gpt-6.1-sol`, reasoning `high`, service tier `fast`.
+  Codex is only ever the backup, never `provider.default`. It is optional: while
+  its OAuth login is unavailable, omit its provider section and `provider.fallback`.
+- On primary failure, explain the failure and continue through Codex when it is
+  configured. Try the primary again on the next turn; preserve context and
+  completed tool results. Without a configured backup, primary failures fail the turn.
+- Sessions keep the provider they last used. A session whose provider is removed
+  from the configuration moves to `provider.default` on its next model turn.
 - Use `Asia/Singapore` for dates and schedules. Dream runs daily at `03:00`.
 - Observe allowed family members in the configured group silently; reply when
   mentioned or sent `/ping`. Allowed private conversations do not require mentions.
@@ -74,12 +79,13 @@ Inspect values locally without dumping the entire file. Required fields are:
 
 | Configuration field | Required setting or source |
 | --- | --- |
-| `provider.default` / `provider.fallback` | `openai-codex` / `deepseek` |
-| `providers.openai-codex.model` | `gpt-6.1-sol` |
-| `providers.openai-codex.reasoning_effort` | `high` |
-| `providers.openai-codex.service_tier` | `fast` |
-| `providers.openai-codex.sandbox` / `workdir` | Preserve approved values; these do not grant filesystem tools |
+| `provider.default` | `deepseek` |
+| `provider.fallback` | `openai-codex` when the backup is configured; otherwise omit |
 | `providers.deepseek.model` | `deepseek-flash` |
+| `providers.openai-codex.model` | Backup only: `gpt-6.1-sol` |
+| `providers.openai-codex.reasoning_effort` | Backup only: `high` |
+| `providers.openai-codex.service_tier` | Backup only: `fast` |
+| `providers.openai-codex.sandbox` / `workdir` | Backup only: preserve approved values; these do not grant filesystem tools |
 | `orison.data_dir` | Existing private runtime directory; normally `.orison` |
 | `channels.default` / `channels.core_url` | `qq` and the actual Core base URL |
 | `channels.qq.ws_url` / `token` | Forward WebSocket URL and its OneBot access token |
@@ -101,7 +107,13 @@ deployment reports. Verify private paths are ignored and untracked.
 
 ## 4. Configure Provider Authentication
 
-Run authentication as the same OS account that runs Core. Use the same OAuth token
+Supply `DEEPSEEK_API_KEY` through Core's private process environment or secret
+manager. Do not place its value in source, commands recorded in reports, or chat.
+Without it, the primary cannot run.
+
+The Codex backup needs an OAuth login. Skip the rest of this section when the
+backup is not configured. Run authentication as the same OS account that runs
+Core. Use the same OAuth token
 path for interactive login and the service process. An explicit path inside
 `.orison/` avoids dependence on another account's login state:
 
@@ -130,10 +142,10 @@ print("Codex OAuth credentials are available")
 PY
 ```
 
-Supply `DEEPSEEK_API_KEY` through Core's private process environment or secret
-manager. Do not place its value in source, commands recorded in reports, or chat.
-Without it, the backup cannot take over. Do not report the full deployment ready
-while either provider remains unverified.
+A token file can still show a future `expires` value after the server has rejected
+it; a `401 token_expired` response means the login must be completed again. Do not
+report the full deployment ready while a configured provider remains unverified,
+and state explicitly when no backup is configured.
 
 ## 5. Connect NapCat and the QQ Channel
 
@@ -197,8 +209,8 @@ network availability, and use the existing persistence policy for user services.
 | `ORISON_CONFIG` | Both: absolute private configuration path |
 | `ORISON_HOST` / `ORISON_PORT` | Core: normally `127.0.0.1` / `8765` |
 | `ORISON_API_TOKEN` | Both: matching Core bearer token, required for non-loopback Core binding |
-| `OAUTH_CLI_KIT_TOKEN_PATH` | Core: same absolute path used during OAuth login |
-| `DEEPSEEK_API_KEY` | Core: private backup API credential |
+| `DEEPSEEK_API_KEY` | Core: private primary API credential |
+| `OAUTH_CLI_KIT_TOKEN_PATH` | Core, backup only: same absolute path used during OAuth login |
 | `ORISON_ONEBOT_HTTP_URL` / `ORISON_ONEBOT_ACCESS_TOKEN` | Core: OneBot HTTP delivery endpoint and credential |
 | `ORISON_CHANNEL` | Channel: `qq`; use `local` for terminal validation |
 | `ORISON_DREAM_DAILY_SCHEDULE` | Core: `daily:03:00` |
@@ -234,14 +246,17 @@ actual delivery separate from configuration and mocked tests.
    working directories, and channel connection logs. Repeated reconnect messages
    mean the QQ channel is not ready, even if its process is running.
 3. **Core HTTP:** Request `/v1/health` and `/v1/providers` using the configured bearer
-   token. Expect both providers to be registered. Health only checks credential
-   availability; `status="ok"` does not prove a model request or backup readiness.
+   token. Expect `deepseek`, plus `openai-codex` when the backup is configured.
+   Health only checks credential availability; `status="ok"` does not prove a
+   model request or backup readiness.
 4. **Local model:** In an authorized live validation, run
    `ORISON_CHANNEL=local .orison/bin/orison-channel` and send a short ordinary
    message. `/ping` is a built-in response and does not exercise a model.
-5. **Backup:** Make a harmless request with explicit provider `deepseek` to
+5. **Provider requests:** Make a harmless request to
    `/v1/sessions/deploy-check-deepseek/messages`, using `channel="local"`, a
-   synthetic `user_id`, and a short `message`. Check the JSON `error` field as well
+   synthetic `user_id`, and a short `message`. When the backup is configured,
+   repeat with explicit provider `openai-codex` on
+   `/v1/sessions/deploy-check-codex/messages`. Check the JSON `error` field as well
    as HTTP status. Use an isolated test runtime to exercise automatic failover;
    do not revoke production credentials or alter family sessions to simulate it.
 6. **QQ:** In the approved test conversation, verify an addressed response, an
@@ -274,8 +289,9 @@ live acceptance checks; they do not replace them.
 | Symptom | Action |
 | --- | --- |
 | Missing private configuration or persona | Restore the approved private files; do not generate a replacement identity |
-| OAuth missing or expired | Check account/token-path consistency, complete private login again, and recheck the primary |
-| Primary fails and backup also fails | Check `DEEPSEEK_API_KEY`, API reachability, account access, and sanitized errors |
+| Primary fails | Check `DEEPSEEK_API_KEY`, API reachability, account access, and sanitized errors |
+| Codex OAuth missing or expired | Check account/token-path consistency, complete private login again, and recheck the backup; or remove the backup from the configuration |
+| Scheduled jobs fail with an error from an unexpected provider | Check the target session's stored provider; it does not follow later `provider.default` changes |
 | QQ replies work but reminders fail | Check the separate OneBot HTTP URL/token and cron error history |
 | QQ channel reconnects repeatedly | Check forward WebSocket server mode, URL, token, QQ login, and network reachability |
 | Memory/storage limit reached | Preserve pending conversations; inspect the configured data directory and maintenance results |

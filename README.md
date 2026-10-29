@@ -9,7 +9,7 @@ Orison is a personal AI companion for family conversations, memory, and everyday
 - Optional, rate-limited spontaneous replies when the family group conversation pauses.
 - Daily Dream consolidation at 03:00; all schedules use `Asia/Singapore`.
 - Reminders, recurring notifications, todos, web lookup, and messaging.
-- Primary `openai-codex` provider with DeepSeek API fallback and failure notices.
+- Primary DeepSeek API provider with an optional `openai-codex` fallback and failure notices.
 
 ## Structure
 

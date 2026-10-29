@@ -209,7 +209,9 @@ class SessionManager:
         metadata = dict(metadata or {})
         now = _now()
         existing = self.get_session(session_id)
-        selected_provider_name = provider_name or (existing.provider_name if existing else self.registry.default_name)
+        # A session keeps its provider unless that provider has since been removed from the config.
+        stored_provider_name = existing.provider_name if existing and existing.provider_name in self.registry.providers else None
+        selected_provider_name = provider_name or stored_provider_name or self.registry.default_name
         session = existing or SessionRecord(
             session_id=session_id,
             provider_name=selected_provider_name,
